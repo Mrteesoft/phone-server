@@ -1,0 +1,16 @@
+### Legacy note
+# This repository no longer uses HTTP request samples as the main usage flow.
+# Phone Server is now a local-first Android app.
+#
+# The intended user flow is:
+# 1. Install and open the app.
+# 2. Grant local permissions if needed.
+# 3. Create a workspace.
+# 4. Run shell commands locally on the phone.
+# 5. Start and control long-running local services from the Services tab.
+#
+# There is no required registration, login, device enrollment, or external
+# control plane in the current target architecture.
+#
+# The old Spring Boot API prototype under `src/main/java/com/phoneserver/controlplane`
+# remains in the repository only as legacy reference.

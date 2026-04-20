@@ -1,0 +1,6 @@
+{
+  "androidAbi": "x86_64",
+  "termuxArchitecture": "x86_64",
+  "prootPackage": "pool/main/p/proot/proot_5.1.107-70_x86_64.deb",
+  "libtallocPackage": "pool/main/libt/libtalloc/libtalloc_2.4.3_x86_64.deb"
+}

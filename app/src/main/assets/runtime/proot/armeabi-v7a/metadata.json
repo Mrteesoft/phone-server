@@ -1,0 +1,6 @@
+{
+  "androidAbi": "armeabi-v7a",
+  "termuxArchitecture": "arm",
+  "prootPackage": "pool/main/p/proot/proot_5.1.107-70_arm.deb",
+  "libtallocPackage": "pool/main/libt/libtalloc/libtalloc_2.4.3_arm.deb"
+}

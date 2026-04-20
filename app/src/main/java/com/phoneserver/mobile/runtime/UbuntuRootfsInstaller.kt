@@ -1,0 +1,310 @@
+package com.phoneserver.mobile.runtime
+
+import android.system.Os
+import java.io.BufferedInputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
+
+class UbuntuRootfsInstaller(
+        private val coordinator: UbuntuRuntimeCoordinator
+) {
+
+    suspend fun install(
+            onSnapshotChanged: suspend (UbuntuRuntimeSnapshot) -> Unit
+    ): UbuntuRuntimeSnapshot = withContext(Dispatchers.IO) {
+        val prepared = coordinator.prepareScaffold()
+        onSnapshotChanged(prepared)
+
+        val source = coordinator.requireRootfsSource()
+        val archiveFile = coordinator.archiveFileFor(source)
+
+        if (!hasVerifiedArchive(archiveFile, source.sha256)) {
+            val downloadStarted = coordinator.markDownloadStarting(source)
+            onSnapshotChanged(downloadStarted)
+            downloadArchive(source, archiveFile) { downloadedBytes, totalBytes ->
+                onSnapshotChanged(
+                        coordinator.updateDownloadProgress(
+                                source = source,
+                                downloadedBytes = downloadedBytes,
+                                totalBytes = totalBytes
+                        )
+                )
+            }
+        } else {
+            onSnapshotChanged(
+                    coordinator.updateDownloadProgress(
+                            source = source,
+                            downloadedBytes = archiveFile.length(),
+                            totalBytes = archiveFile.length()
+                    )
+            )
+        }
+
+        verifyArchiveSha256(archiveFile, source.sha256)
+
+        val extracting = coordinator.markExtracting(source, archiveFile.length())
+        onSnapshotChanged(extracting)
+
+        coordinator.resetRootfsDirectory()
+        extractArchive(archiveFile, coordinator.rootfsDirectory()) { extractedEntries ->
+            if (extractedEntries % EXTRACTION_PROGRESS_STEP == 0) {
+                onSnapshotChanged(
+                        coordinator.updateExtractionProgress(
+                                source = source,
+                                extractedEntries = extractedEntries,
+                                archiveBytes = archiveFile.length()
+                        )
+                )
+            }
+        }
+
+        val ready = coordinator.markReady(source)
+        onSnapshotChanged(ready)
+        ready
+    }
+
+    private suspend fun hasVerifiedArchive(
+            archiveFile: File,
+            expectedSha256: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!archiveFile.exists() || !archiveFile.isFile) {
+            return@withContext false
+        }
+
+        try {
+            calculateSha256(archiveFile) == expectedSha256.lowercase()
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    private suspend fun downloadArchive(
+            source: UbuntuRootfsSource,
+            archiveFile: File,
+            onProgress: suspend (downloadedBytes: Long, totalBytes: Long) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        archiveFile.parentFile?.mkdirs()
+        val tempFile = File(archiveFile.parentFile, "${source.fileName}.part")
+        if (tempFile.exists()) {
+            tempFile.delete()
+        }
+
+        val connection = (URL(source.downloadUrl).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 30_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+        }
+
+        try {
+            connection.connect()
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                throw IOException("Ubuntu rootfs download failed with HTTP $responseCode.")
+            }
+
+            val totalBytes = connection.contentLengthLong.takeIf { it > 0L } ?: 0L
+            var downloadedBytes = 0L
+            var lastReportedBytes = Long.MIN_VALUE
+            onProgress(downloadedBytes, totalBytes)
+
+            connection.inputStream.use { input ->
+                BufferedInputStream(input).use { bufferedInput: BufferedInputStream ->
+                    FileOutputStream(tempFile).use { output: FileOutputStream ->
+                        val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                        while (true) {
+                            val bytesRead = bufferedInput.read(buffer)
+                            if (bytesRead < 0) {
+                                break
+                            }
+                            output.write(buffer, 0, bytesRead)
+                            downloadedBytes += bytesRead
+                            if (downloadedBytes == totalBytes ||
+                                    downloadedBytes - lastReportedBytes >= DOWNLOAD_PROGRESS_STEP ||
+                                    lastReportedBytes == Long.MIN_VALUE) {
+                                onProgress(downloadedBytes, totalBytes)
+                                lastReportedBytes = downloadedBytes
+                            }
+                        }
+                        onProgress(downloadedBytes, totalBytes)
+                        output.fd.sync()
+                    }
+                }
+            }
+
+            if (archiveFile.exists()) {
+                archiveFile.delete()
+            }
+            if (!tempFile.renameTo(archiveFile)) {
+                throw IOException("Failed to move Ubuntu archive into cache storage.")
+            }
+        } finally {
+            connection.disconnect()
+            if (tempFile.exists() && archiveFile.exists()) {
+                tempFile.delete()
+            }
+        }
+    }
+
+    private suspend fun verifyArchiveSha256(
+            archiveFile: File,
+            expectedSha256: String
+    ) = withContext(Dispatchers.IO) {
+        val actualSha256 = calculateSha256(archiveFile)
+        if (actualSha256 != expectedSha256.lowercase()) {
+            throw IOException(
+                    "Ubuntu rootfs checksum mismatch. Expected $expectedSha256 but got $actualSha256."
+            )
+        }
+    }
+
+    private suspend fun extractArchive(
+            archiveFile: File,
+            rootfsDirectory: File,
+            onEntryExtracted: suspend (Int) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        var extractedEntries = 0
+
+        FileInputStream(archiveFile).use { fileInputStream: FileInputStream ->
+            BufferedInputStream(fileInputStream).use { bufferedInputStream: BufferedInputStream ->
+                GzipCompressorInputStream(bufferedInputStream).use { gzipInputStream: GzipCompressorInputStream ->
+                    TarArchiveInputStream(gzipInputStream).use { tarInputStream: TarArchiveInputStream ->
+                        var entry: TarArchiveEntry? = tarInputStream.nextEntry
+                        while (entry != null) {
+                            val target = safeResolve(rootfsDirectory, entry.name)
+                            when {
+                                entry.isDirectory -> {
+                                    if (!target.exists()) {
+                                        target.mkdirs()
+                                    }
+                                }
+
+                                entry.isSymbolicLink -> createSymbolicLink(target, entry.linkName)
+                                entry.isLink -> createHardLink(rootfsDirectory, target, entry.linkName)
+                                else -> writeRegularFile(tarInputStream, target)
+                            }
+
+                            applyPermissions(target, entry.mode, entry.isDirectory)
+                            extractedEntries += 1
+                            onEntryExtracted(extractedEntries)
+                            entry = tarInputStream.nextEntry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun writeRegularFile(
+            tarInputStream: TarArchiveInputStream,
+            target: File
+    ) {
+        target.parentFile?.mkdirs()
+        FileOutputStream(target).use { output ->
+            val buffer = ByteArray(EXTRACTION_BUFFER_SIZE)
+            while (true) {
+                val bytesRead = tarInputStream.read(buffer)
+                if (bytesRead < 0) {
+                    break
+                }
+                output.write(buffer, 0, bytesRead)
+            }
+            output.fd.sync()
+        }
+    }
+
+    private fun createSymbolicLink(
+            target: File,
+            linkName: String
+    ) {
+        target.parentFile?.mkdirs()
+        if (target.exists() || target.isDirectory || target.isFile) {
+            target.delete()
+        }
+        runCatching { Os.symlink(linkName, target.absolutePath) }
+                .getOrElse { error ->
+                    throw IOException("Failed to create symbolic link ${target.absolutePath}.", error)
+                }
+    }
+
+    private fun createHardLink(
+            rootfsDirectory: File,
+            target: File,
+            linkName: String
+    ) {
+        val source = safeResolve(rootfsDirectory, linkName)
+        target.parentFile?.mkdirs()
+        if (target.exists() || target.isDirectory || target.isFile) {
+            target.delete()
+        }
+        runCatching { Os.link(source.absolutePath, target.absolutePath) }
+                .getOrElse { error ->
+                    throw IOException(
+                            "Failed to create hard link ${target.absolutePath} -> ${source.absolutePath}.",
+                            error
+                    )
+                }
+    }
+
+    private fun safeResolve(
+            rootDirectory: File,
+            entryName: String
+    ): File {
+        val rootPath = rootDirectory.toPath().normalize()
+        val resolvedPath = rootPath.resolve(entryName).normalize()
+        if (!resolvedPath.startsWith(rootPath)) {
+            throw IOException("Refusing to extract outside the Ubuntu rootfs: $entryName")
+        }
+        return resolvedPath.toFile()
+    }
+
+    private fun applyPermissions(
+            target: File,
+            mode: Int,
+            isDirectory: Boolean
+    ) {
+        if (!target.exists()) {
+            return
+        }
+
+        val ownerRead = mode and 0b100_000_000 != 0
+        val ownerWrite = mode and 0b010_000_000 != 0
+        val ownerExecute = mode and 0b001_000_000 != 0
+
+        target.setReadable(ownerRead || isDirectory, true)
+        target.setWritable(ownerWrite, true)
+        target.setExecutable(ownerExecute || isDirectory, true)
+    }
+
+    private fun calculateSha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(HASH_BUFFER_SIZE)
+            while (true) {
+                val bytesRead = input.read(buffer)
+                if (bytesRead < 0) {
+                    break
+                }
+                digest.update(buffer, 0, bytesRead)
+            }
+        }
+        return digest.digest().joinToString(separator = "") { byte -> "%02x".format(byte) }
+    }
+
+    private companion object {
+        const val DOWNLOAD_BUFFER_SIZE = 64 * 1024
+        const val DOWNLOAD_PROGRESS_STEP = 512 * 1024
+        const val EXTRACTION_BUFFER_SIZE = 64 * 1024
+        const val HASH_BUFFER_SIZE = 64 * 1024
+        const val EXTRACTION_PROGRESS_STEP = 120
+    }
+}
