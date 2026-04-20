@@ -1,9 +1,11 @@
 package com.phoneserver.mobile.runtime
 
 import java.io.File
+import java.io.IOException
 
 class UbuntuProotBackend(
-        private val runtimeSnapshotProvider: () -> UbuntuRuntimeSnapshot
+        private val runtimeSnapshotProvider: () -> UbuntuRuntimeSnapshot,
+        private val pathMapper: WorkspacePathMapper
 ) : TerminalBackend {
 
     private var session: PtyTerminalSession? = null
@@ -16,6 +18,12 @@ class UbuntuProotBackend(
     override val homeDirectory: File
         get() = File(runtimeSnapshotProvider().homePath)
     override val commandHint: String = "Run apt, bash, python3, git, and other Ubuntu userspace commands."
+    override val displayHomeDirectory: String = "/root"
+    override val defaultWorkingDirectory: String = "/root"
+
+    override suspend fun isAvailable(): Boolean = runtimeSnapshotProvider().backendReady
+
+    override fun mapWorkspacePath(hostPath: String): String = pathMapper.toUbuntuPath(hostPath)
 
     override suspend fun execute(
             command: String,
@@ -62,7 +70,52 @@ class UbuntuProotBackend(
                         exitCode = 127
                 )
 
-        return terminalSession.changeDirectory(targetDirectory, timeoutSeconds)
+        val runtimeDirectory = normalizeWorkingDirectory(targetDirectory.absolutePath)
+        return terminalSession.execute(
+                command = "cd ${runtimeDirectory.shellQuoted()}",
+                timeoutSeconds = timeoutSeconds
+        )
+    }
+
+    override fun normalizeWorkingDirectory(path: String): String {
+        return mapWorkspacePath(path)
+    }
+
+    override suspend fun launchManagedProcess(
+            command: String,
+            workingDirectory: String
+    ): ManagedServiceLaunch {
+        val snapshot = runtimeSnapshotProvider()
+        if (!snapshot.backendReady || snapshot.runtimeLauncherPath.isBlank()) {
+            throw IllegalStateException(buildUnavailableMessage(snapshot, command))
+        }
+
+        val launcher = File(snapshot.runtimeLauncherPath)
+        if (!launcher.exists()) {
+            throw IOException("Ubuntu launcher script is missing from ${launcher.absolutePath}.")
+        }
+
+        val runtimeDirectory = normalizeWorkingDirectory(workingDirectory)
+        val hostWorkingDirectory = File(snapshot.workspaceMountPath)
+                .takeIf { it.exists() && it.isDirectory }
+                ?: File(snapshot.runtimeRootPath).takeIf { it.exists() && it.isDirectory }
+                ?: launcher.parentFile
+
+        val process = ProcessBuilder(
+                launcher.absolutePath,
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-lc",
+                "cd ${runtimeDirectory.shellQuoted()} && $command"
+        ).directory(hostWorkingDirectory)
+                .redirectErrorStream(true)
+                .start()
+
+        return ManagedServiceLaunch(
+                process = process,
+                workingDirectory = runtimeDirectory
+        )
     }
 
     override suspend fun close() {
@@ -106,7 +159,18 @@ class UbuntuProotBackend(
             snapshot: UbuntuRuntimeSnapshot,
             command: String
     ): TerminalCommandResult {
-        val output = when (snapshot.phase) {
+        return TerminalCommandResult(
+                output = buildUnavailableMessage(snapshot, command),
+                currentDirectory = homeDirectory,
+                exitCode = 127
+        )
+    }
+
+    private fun buildUnavailableMessage(
+            snapshot: UbuntuRuntimeSnapshot,
+            command: String
+    ): String {
+        return when (snapshot.phase) {
             UbuntuInstallPhase.NOT_INSTALLED ->
                 "Ubuntu 22.04 is not installed yet. Prepare the runtime first from the Services tab."
 
@@ -123,11 +187,7 @@ class UbuntuProotBackend(
             UbuntuInstallPhase.FAILED ->
                 snapshot.errorMessage ?: "Ubuntu runtime setup failed."
         }
-
-        return TerminalCommandResult(
-                output = output,
-                currentDirectory = homeDirectory,
-                exitCode = 127
-        )
     }
+
+    private fun String.shellQuoted(): String = "'" + replace("'", "'\"'\"'") + "'"
 }

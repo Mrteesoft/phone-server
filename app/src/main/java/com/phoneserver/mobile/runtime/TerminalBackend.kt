@@ -25,12 +25,32 @@ data class RuntimeActionResult(
         val message: String
 )
 
+data class ManagedServiceLaunch(
+        val process: Process,
+        val workingDirectory: String
+)
+
 interface TerminalBackend {
     val kind: TerminalBackendKind
     val displayName: String
     val detail: String
     val homeDirectory: File
     val commandHint: String
+    val displayHomeDirectory: String
+        get() = homeDirectory.absolutePath
+    val defaultWorkingDirectory: String
+        get() = displayHomeDirectory
+
+    suspend fun isAvailable(): Boolean = true
+
+    fun mapWorkspacePath(hostPath: String): String = normalizeWorkingDirectory(hostPath)
+
+    fun normalizeWorkingDirectory(path: String): String = path
+
+    suspend fun launchManagedProcess(
+            command: String,
+            workingDirectory: String
+    ): ManagedServiceLaunch
 
     suspend fun execute(
             command: String,

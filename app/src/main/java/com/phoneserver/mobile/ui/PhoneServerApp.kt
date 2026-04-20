@@ -847,7 +847,7 @@ private fun ServicesScreen(
                 ) {
                     Text("Start managed service", style = MaterialTheme.typography.titleMedium)
                     Text(
-                            text = "This runs a long-lived command in the current terminal workspace, for example `python -m http.server 8080`.",
+                            text = "This runs a long-lived command in the current terminal directory, for example `python -m http.server 8080`.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     OutlinedTextField(

@@ -255,7 +255,11 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                 workspaceManager.markOpened(path)
                 refreshWorkspaces()
             }
-            applyCommandResult(result, streamedOutput = false, successMessage = "Terminal moved to $path")
+            applyCommandResult(
+                    result,
+                    streamedOutput = false,
+                    successMessage = "Terminal moved to ${result.currentDirectory.absolutePath}"
+            )
         }
     }
 
@@ -316,15 +320,10 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         viewModelScope.launch {
-            val currentDirectory = File(_uiState.value.currentDirectory)
-                    .takeIf { it.exists() && it.isDirectory }
-                    ?: workspaceManager.rootDirectory()
-
             val snapshot = runCatching {
                 PhoneServerRuntimeManager.startManagedService(
                         command = command,
-                        workingDirectory = currentDirectory,
-                        displayName = currentDirectory.name.ifBlank { "service" }
+                        workingDirectory = _uiState.value.currentDirectory
                 )
             }.getOrElse { exception ->
                 appendLine(
@@ -383,7 +382,14 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
 
     fun useAndroidRuntime() {
         viewModelScope.launch {
+            val sourceKind = _uiState.value.terminalRuntime.kind
             val result = PhoneServerRuntimeManager.switchTerminalRuntime(TerminalBackendKind.ANDROID_LOCAL)
+            if (result.success) {
+                updateDirectoryForRuntimeSwitch(
+                        sourceKind = sourceKind,
+                        targetKind = TerminalBackendKind.ANDROID_LOCAL
+                )
+            }
             appendLine(
                     kind = if (result.success) TerminalLineKind.STATUS else TerminalLineKind.ERROR,
                     text = result.message
@@ -393,7 +399,14 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
 
     fun useUbuntuRuntime() {
         viewModelScope.launch {
+            val sourceKind = _uiState.value.terminalRuntime.kind
             val result = PhoneServerRuntimeManager.switchTerminalRuntime(TerminalBackendKind.UBUNTU_2204)
+            if (result.success) {
+                updateDirectoryForRuntimeSwitch(
+                        sourceKind = sourceKind,
+                        targetKind = TerminalBackendKind.UBUNTU_2204
+                )
+            }
             appendLine(
                     kind = if (result.success) TerminalLineKind.STATUS else TerminalLineKind.ERROR,
                     text = result.message
@@ -456,6 +469,30 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                             workspaceCount = current.workspaces.size,
                             currentDirectory = current.currentDirectory,
                             runningCommand = running,
+                            managedServiceCount = current.managedServices.count { it.status == "RUNNING" },
+                            runtimeServiceActive = PhoneServerRuntimeManager.runtimeServiceActive.value
+                    )
+            )
+        }
+    }
+
+    private fun updateDirectoryForRuntimeSwitch(
+            sourceKind: TerminalBackendKind,
+            targetKind: TerminalBackendKind
+    ) {
+        _uiState.update { current ->
+            val mappedDirectory = PhoneServerRuntimeManager.remapDisplayedPathForRuntimeSwitch(
+                    path = current.currentDirectory,
+                    sourceKind = sourceKind,
+                    targetKind = targetKind
+            )
+
+            current.copy(
+                    currentDirectory = mappedDirectory,
+                    services = buildServices(
+                            workspaceCount = current.workspaces.size,
+                            currentDirectory = mappedDirectory,
+                            runningCommand = current.runningCommand,
                             managedServiceCount = current.managedServices.count { it.status == "RUNNING" },
                             runtimeServiceActive = PhoneServerRuntimeManager.runtimeServiceActive.value
                     )

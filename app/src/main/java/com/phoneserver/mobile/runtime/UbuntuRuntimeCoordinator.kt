@@ -392,6 +392,9 @@ class UbuntuRuntimeCoordinator(
             appendLine("if [ -d /apex ]; then ARGS=\"${'$'}ARGS -b /apex:/apex\"; fi")
             appendLine("if [ -d /storage ]; then ARGS=\"${'$'}ARGS -b /storage:/storage\"; fi")
             appendLine("if [ -e /linkerconfig/ld.config.txt ]; then ARGS=\"${'$'}ARGS -b /linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt\"; fi")
+            appendLine("if [ \"${'$'}#\" -gt 0 ]; then")
+            appendLine("  exec \"${'$'}PROOT_BIN\" ${'$'}ARGS /usr/bin/env -i HOME=/root TERM=\"${'$'}TERM\" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \"${'$'}@\"")
+            appendLine("fi")
             appendLine("exec \"${'$'}PROOT_BIN\" ${'$'}ARGS /usr/bin/env -i HOME=/root TERM=\"${'$'}TERM\" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc")
         }
     }

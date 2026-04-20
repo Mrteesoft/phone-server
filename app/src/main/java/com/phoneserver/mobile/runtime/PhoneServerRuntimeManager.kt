@@ -29,6 +29,7 @@ data class ManagedServiceSnapshot(
         val id: String,
         val name: String,
         val command: String,
+        val backendKind: TerminalBackendKind,
         val workingDirectory: String,
         val status: ManagedServiceStatus,
         val startedAt: String,
@@ -41,7 +42,8 @@ private data class ManagedServiceRuntime(
         val id: String,
         val name: String,
         val command: String,
-        val workingDirectory: File,
+        val backendKind: TerminalBackendKind,
+        val workingDirectory: String,
         val process: Process,
         var stopRequested: Boolean
 )
@@ -96,6 +98,7 @@ object PhoneServerRuntimeManager {
     private lateinit var ubuntuRootfsInstaller: UbuntuRootfsInstaller
     private lateinit var bundledProotInstaller: BundledProotInstaller
     private lateinit var ubuntuRuntimeCoordinator: UbuntuRuntimeCoordinator
+    private lateinit var workspacePathMapper: WorkspacePathMapper
     private lateinit var terminalHistoryStore: TerminalHistoryStore
     private var activeTerminalBackendKind: TerminalBackendKind = TerminalBackendKind.ANDROID_LOCAL
     private var ubuntuInstallJob: Job? = null
@@ -115,6 +118,7 @@ object PhoneServerRuntimeManager {
 
             appContext = context.applicationContext
             val homeDirectory = File(appContext.filesDir, "workspaces").apply { mkdirs() }
+            workspacePathMapper = WorkspacePathMapper(homeDirectory)
             androidShellBackend = AndroidShellBackend(homeDirectory)
             ubuntuRuntimeCoordinator = UbuntuRuntimeCoordinator(appContext)
             bundledProotInstaller = BundledProotInstaller(
@@ -124,7 +128,10 @@ object PhoneServerRuntimeManager {
             runCatching { bundledProotInstaller.install() }
             ubuntuRootfsInstaller = UbuntuRootfsInstaller(ubuntuRuntimeCoordinator)
             val ubuntuSnapshot = ubuntuRuntimeCoordinator.initialize()
-            ubuntuProotBackend = UbuntuProotBackend { _ubuntuRuntime.value }
+            ubuntuProotBackend = UbuntuProotBackend(
+                    runtimeSnapshotProvider = { _ubuntuRuntime.value },
+                    pathMapper = workspacePathMapper
+            )
             terminalHistoryStore = TerminalHistoryStore(appContext)
             _ubuntuRuntime.value = ubuntuSnapshot
             publishTerminalRuntimeLocked()
@@ -153,7 +160,7 @@ object PhoneServerRuntimeManager {
     ): TerminalCommandResult {
         val backend = requireActiveTerminalBackend()
         val result = backend.changeDirectory(targetDirectory, timeoutSeconds)
-        appendTerminalHistory("cd ${targetDirectory.absolutePath}", result)
+        appendTerminalHistory("cd ${backend.mapWorkspacePath(targetDirectory.absolutePath)}", result)
         return result
     }
 
@@ -272,17 +279,28 @@ object PhoneServerRuntimeManager {
         }
     }
 
+    fun remapDisplayedPathForRuntimeSwitch(
+            path: String,
+            sourceKind: TerminalBackendKind,
+            targetKind: TerminalBackendKind
+    ): String {
+        check(initialized) { "Runtime manager has not been initialized." }
+        return workspacePathMapper.translateDisplayedPath(
+                path = path,
+                sourceKind = sourceKind,
+                targetKind = targetKind
+        )
+    }
+
     suspend fun startManagedService(
             command: String,
-            workingDirectory: File,
+            workingDirectory: String,
             displayName: String? = null,
             preferredId: String? = null
     ): ManagedServiceSnapshot = runtimeMutex.withLock {
         val trimmed = command.trim()
         require(trimmed.isNotEmpty()) { "Service command cannot be empty." }
-        require(workingDirectory.exists() && workingDirectory.isDirectory) {
-            "Working directory does not exist."
-        }
+        val backend = requireActiveTerminalBackend()
 
         val id = preferredId ?: UUID.randomUUID().toString()
         if (preferredId != null) {
@@ -293,17 +311,18 @@ object PhoneServerRuntimeManager {
             }
         }
 
-        val process = ProcessBuilder(resolveShellPath(), "-c", trimmed)
-                .directory(workingDirectory)
-                .redirectErrorStream(true)
-                .start()
+        val launch = backend.launchManagedProcess(
+                command = trimmed,
+                workingDirectory = workingDirectory
+        )
 
         val now = Instant.now().toString()
         val snapshot = ManagedServiceSnapshot(
                 id = id,
-                name = displayName ?: workingDirectory.name.ifBlank { "service" },
+                name = displayName ?: serviceNameForWorkingDirectory(launch.workingDirectory),
                 command = trimmed,
-                workingDirectory = workingDirectory.absolutePath,
+                backendKind = backend.kind,
+                workingDirectory = launch.workingDirectory,
                 status = ManagedServiceStatus.RUNNING,
                 startedAt = now,
                 updatedAt = now,
@@ -315,12 +334,13 @@ object PhoneServerRuntimeManager {
                 id = id,
                 name = snapshot.name,
                 command = trimmed,
-                workingDirectory = workingDirectory,
-                process = process,
+                backendKind = snapshot.backendKind,
+                workingDirectory = snapshot.workingDirectory,
+                process = launch.process,
                 stopRequested = false
         )
         publishServiceSnapshotsLocked()
-        observeServiceProcess(id, process)
+        observeServiceProcess(id, launch.process)
         snapshot
     }
 
@@ -346,13 +366,19 @@ object PhoneServerRuntimeManager {
             activeProcesses.remove(serviceId)
         }
 
-        val process = ProcessBuilder(resolveShellPath(), "-c", existingSnapshot.command)
-                .directory(File(existingSnapshot.workingDirectory))
-                .redirectErrorStream(true)
-                .start()
+        val backend = terminalBackendFor(existingSnapshot.backendKind)
+        val launch = runCatching {
+            backend.launchManagedProcess(
+                    command = existingSnapshot.command,
+                    workingDirectory = existingSnapshot.workingDirectory
+            )
+        }.getOrElse {
+            return@withLock false
+        }
 
         val now = Instant.now().toString()
         val restartedSnapshot = existingSnapshot.copy(
+                workingDirectory = launch.workingDirectory,
                 status = ManagedServiceStatus.RUNNING,
                 startedAt = now,
                 updatedAt = now,
@@ -364,12 +390,13 @@ object PhoneServerRuntimeManager {
                 id = serviceId,
                 name = restartedSnapshot.name,
                 command = restartedSnapshot.command,
-                workingDirectory = File(restartedSnapshot.workingDirectory),
-                process = process,
+                backendKind = restartedSnapshot.backendKind,
+                workingDirectory = restartedSnapshot.workingDirectory,
+                process = launch.process,
                 stopRequested = false
         )
         publishServiceSnapshotsLocked()
-        observeServiceProcess(serviceId, process)
+        observeServiceProcess(serviceId, launch.process)
         true
     }
 
@@ -477,7 +504,11 @@ object PhoneServerRuntimeManager {
 
     private fun requireActiveTerminalBackend(): TerminalBackend {
         check(initialized) { "Runtime manager has not been initialized." }
-        return when (activeTerminalBackendKind) {
+        return terminalBackendFor(activeTerminalBackendKind)
+    }
+
+    private fun terminalBackendFor(kind: TerminalBackendKind): TerminalBackend {
+        return when (kind) {
             TerminalBackendKind.ANDROID_LOCAL -> androidShellBackend
             TerminalBackendKind.UBUNTU_2204 -> ubuntuProotBackend
         }
@@ -492,7 +523,7 @@ object PhoneServerRuntimeManager {
                 kind = backend.kind,
                 displayName = backend.displayName,
                 detail = backend.detail,
-                homeDirectory = backend.homeDirectory.absolutePath,
+                homeDirectory = backend.displayHomeDirectory,
                 commandHint = backend.commandHint
         )
     }
@@ -504,9 +535,12 @@ object PhoneServerRuntimeManager {
         }
     }
 
-    private fun resolveShellPath(): String {
-        val candidates = listOf("/system/bin/sh", "/system/xbin/sh", "sh")
-        return candidates.firstOrNull { candidate -> candidate == "sh" || File(candidate).exists() }
-                ?: "sh"
+    private fun serviceNameForWorkingDirectory(path: String): String {
+        val trimmed = path.trim().trimEnd('/')
+        if (trimmed.isEmpty()) {
+            return "service"
+        }
+
+        return trimmed.substringAfterLast('/').ifBlank { "service" }
     }
 }
