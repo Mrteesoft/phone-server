@@ -40,6 +40,14 @@ internal object PtyBridge {
 
     fun signal(pid: Int, signal: Int): Boolean = nativeSignal(pid, signal)
 
+    fun resize(masterFd: Int, columns: Int, rows: Int): Boolean {
+        return nativeResize(
+                masterFd = masterFd,
+                columns = columns,
+                rows = rows
+        )
+    }
+
     private external fun nativeStart(
             argv: Array<String>,
             environment: Array<String>,
@@ -51,4 +59,10 @@ internal object PtyBridge {
     private external fun nativeWaitFor(pid: Int): Int
 
     private external fun nativeSignal(pid: Int, signal: Int): Boolean
+
+    private external fun nativeResize(
+            masterFd: Int,
+            columns: Int,
+            rows: Int
+    ): Boolean
 }

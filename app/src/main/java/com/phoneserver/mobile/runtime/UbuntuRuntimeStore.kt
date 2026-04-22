@@ -32,11 +32,15 @@ class UbuntuRuntimeStore(context: Context) {
                 runtimeRootPath = json.optString("runtimeRootPath"),
                 rootfsPath = json.optString("rootfsPath"),
                 homePath = json.optString("homePath"),
+                guestHomePath = json.optString("guestHomePath", "/root"),
+                guestWorkspacePath = json.optString("guestWorkspacePath", "/workspace"),
+                defaultUsername = json.optString("defaultUsername", "root"),
                 cachePath = json.optString("cachePath"),
                 archivePath = json.optString("archivePath"),
                 archiveFileName = json.optString("archiveFileName"),
                 prootPath = json.optString("prootPath"),
                 runtimeLauncherPath = json.optString("runtimeLauncherPath"),
+                diagnosticsPath = json.optString("diagnosticsPath"),
                 sourceUrl = json.optString("sourceUrl"),
                 sourcePageUrl = json.optString("sourcePageUrl"),
                 expectedSha256 = json.optString("expectedSha256"),
@@ -61,11 +65,15 @@ class UbuntuRuntimeStore(context: Context) {
                 .put("runtimeRootPath", snapshot.runtimeRootPath)
                 .put("rootfsPath", snapshot.rootfsPath)
                 .put("homePath", snapshot.homePath)
+                .put("guestHomePath", snapshot.guestHomePath)
+                .put("guestWorkspacePath", snapshot.guestWorkspacePath)
+                .put("defaultUsername", snapshot.defaultUsername)
                 .put("cachePath", snapshot.cachePath)
                 .put("archivePath", snapshot.archivePath)
                 .put("archiveFileName", snapshot.archiveFileName)
                 .put("prootPath", snapshot.prootPath)
                 .put("runtimeLauncherPath", snapshot.runtimeLauncherPath)
+                .put("diagnosticsPath", snapshot.diagnosticsPath)
                 .put("sourceUrl", snapshot.sourceUrl)
                 .put("sourcePageUrl", snapshot.sourcePageUrl)
                 .put("expectedSha256", snapshot.expectedSha256)

@@ -6,12 +6,14 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -23,6 +25,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.Folder
@@ -68,9 +71,13 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -155,6 +162,9 @@ fun PhoneServerApp(viewModel: PhoneServerViewModel) {
                     runtime = uiState.terminalRuntime,
                     ubuntuRuntime = uiState.ubuntuRuntime,
                     onRunCommand = viewModel::runCommand,
+                    onClearTerminal = viewModel::clearTerminal,
+                    onInterruptTerminal = viewModel::interruptTerminal,
+                    onResizeTerminal = viewModel::resizeTerminal,
                     onPrepareUbuntuRuntime = viewModel::prepareUbuntuRuntime,
                     onInstallUbuntuRuntime = viewModel::installUbuntuRuntime,
                     onUseAndroidRuntime = viewModel::useAndroidRuntime,
@@ -281,6 +291,9 @@ private fun TerminalScreen(
         runtime: TerminalRuntimeSummary,
         ubuntuRuntime: UbuntuRuntimeSummary,
         onRunCommand: (String) -> Unit,
+        onClearTerminal: () -> Unit,
+        onInterruptTerminal: () -> Unit,
+        onResizeTerminal: (Int, Int) -> Unit,
         onPrepareUbuntuRuntime: () -> Unit,
         onInstallUbuntuRuntime: () -> Unit,
         onUseAndroidRuntime: () -> Unit,
@@ -290,6 +303,8 @@ private fun TerminalScreen(
     val listState = rememberLazyListState()
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
+    val clipboardManager = LocalClipboardManager.current
+    val density = LocalDensity.current
     val terminalInteractionSource = remember { MutableInteractionSource() }
     val terminalTapModifier = Modifier.pointerInput(Unit) {
         detectTapGestures(
@@ -305,7 +320,8 @@ private fun TerminalScreen(
 
         runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
                 (ubuntuRuntime.phase == UbuntuInstallPhase.DOWNLOADING_ROOTFS.name ||
-                        ubuntuRuntime.phase == UbuntuInstallPhase.EXTRACTING_ROOTFS.name) -> Color(0xFFF59E0B)
+                        ubuntuRuntime.phase == UbuntuInstallPhase.EXTRACTING_ROOTFS.name ||
+                        ubuntuRuntime.phase == UbuntuInstallPhase.VERIFYING_BOOT.name) -> Color(0xFFF59E0B)
 
         uiState.runningCommand -> Color(0xFFF59E0B)
         else -> Color(0xFF10B981)
@@ -316,6 +332,9 @@ private fun TerminalScreen(
 
         runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
                 ubuntuRuntime.phase == UbuntuInstallPhase.EXTRACTING_ROOTFS.name -> "extracting"
+
+        runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                ubuntuRuntime.phase == UbuntuInstallPhase.VERIFYING_BOOT.name -> "verifying"
 
         runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
                 ubuntuRuntime.phase == UbuntuInstallPhase.FAILED.name -> "failed"
@@ -350,6 +369,7 @@ private fun TerminalScreen(
             modifier = modifier
                     .fillMaxSize()
                     .background(Color(0xFF05070A))
+                    .imePadding()
                     .clickable(
                             interactionSource = terminalInteractionSource,
                             indication = null
@@ -524,6 +544,16 @@ private fun TerminalScreen(
                 )
             }
 
+            runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                    ubuntuRuntime.phase == UbuntuInstallPhase.VERIFYING_BOOT.name -> {
+                Text(
+                        text = ubuntuRuntime.detail,
+                        color = Color(0xFF9CA3AF),
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall
+                )
+            }
+
             runtime.kind == TerminalBackendKind.UBUNTU_2204 -> {
                 Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -531,7 +561,7 @@ private fun TerminalScreen(
                         verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                            text = "Ubuntu userspace active.",
+                            text = "Ubuntu userspace active. ${ubuntuRuntime.defaultUsername}@phone boots through /bin/bash --login.",
                             color = Color(0xFF9CA3AF),
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.bodySmall,
@@ -548,15 +578,23 @@ private fun TerminalScreen(
             }
         }
 
-        Box(
+        BoxWithConstraints(
                 modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
         ) {
+            val minCellWidthPx = with(density) { 9.dp.roundToPx() }
+            val minCellHeightPx = with(density) { 20.dp.roundToPx() }
+
             LazyColumn(
                     modifier = Modifier
                             .fillMaxSize()
                             .padding(top = 6.dp, bottom = 72.dp)
+                            .onSizeChanged { size ->
+                                val columns = (size.width / minCellWidthPx).coerceAtLeast(40)
+                                val rows = (size.height / minCellHeightPx).coerceAtLeast(16)
+                                onResizeTerminal(columns, rows)
+                            }
                             .then(terminalTapModifier),
                     state = listState,
                     verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -569,13 +607,15 @@ private fun TerminalScreen(
                         TerminalLineKind.ERROR -> Color(0xFFFF8B7C)
                     }
 
-                    Text(
-                            text = line.text,
-                            fontFamily = FontFamily.Monospace,
-                            color = lineColor,
-                            style = MaterialTheme.typography.bodyMedium,
-                            lineHeight = MaterialTheme.typography.bodyMedium.lineHeight
-                    )
+                    SelectionContainer {
+                        Text(
+                                text = line.text,
+                                fontFamily = FontFamily.Monospace,
+                                color = lineColor,
+                                style = MaterialTheme.typography.bodyMedium,
+                                lineHeight = MaterialTheme.typography.bodyMedium.lineHeight
+                        )
+                    }
                 }
             }
             Column(
@@ -584,8 +624,70 @@ private fun TerminalScreen(
                             .fillMaxWidth()
                             .background(Color(0xFF05070A))
             ) {
+                Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                            onClick = onInterruptTerminal,
+                            enabled = uiState.runningCommand,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                                text = "ctrl+c",
+                                color = if (uiState.runningCommand) Color(0xFFFCA5A5) else Color(0xFF6B7280),
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    TextButton(
+                            onClick = { command += "\t" },
+                            enabled = !uiState.runningCommand,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                                text = "tab",
+                                color = if (uiState.runningCommand) Color(0xFF6B7280) else Color(0xFFA7F3D0),
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    TextButton(
+                            onClick = {
+                                val clipboardText = clipboardManager.getText()?.text.orEmpty()
+                                if (clipboardText.isNotEmpty()) {
+                                    command += clipboardText
+                                }
+                            },
+                            enabled = !uiState.runningCommand,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                                text = "paste",
+                                color = if (uiState.runningCommand) Color(0xFF6B7280) else Color(0xFFA7F3D0),
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    TextButton(
+                            onClick = onClearTerminal,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                                text = "clear",
+                                color = Color(0xFFA7F3D0),
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
                 Text(
-                        text = "tap anywhere to type, then press enter or run",
+                        text = if (runtime.kind == TerminalBackendKind.UBUNTU_2204) {
+                            "tap anywhere to type, then press enter or run. ubuntu diagnostics: ${ubuntuRuntime.diagnosticsPath.ifBlank { "pending" }}"
+                        } else {
+                            "tap anywhere to type, then press enter or run"
+                        },
                         color = Color(0xFF4B5563),
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.bodySmall
@@ -597,10 +699,16 @@ private fun TerminalScreen(
                         verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                            text = "$",
+                            text = buildPrompt(
+                                    runtime = runtime,
+                                    ubuntuRuntime = ubuntuRuntime,
+                                    currentDirectory = uiState.currentDirectory
+                            ),
                             color = Color(0xFFA7F3D0),
                             fontFamily = FontFamily.Monospace,
-                            style = MaterialTheme.typography.bodyLarge
+                            style = MaterialTheme.typography.bodyLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                     )
                     Spacer(modifier = Modifier.size(8.dp))
                     BasicTextField(
@@ -865,6 +973,16 @@ private fun ServicesScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
+                            text = "Guest home: ${ubuntuRuntime.guestHomePath}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                            text = "Default user: ${ubuntuRuntime.defaultUsername}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
                             text = "Archive cache: ${ubuntuRuntime.archivePath.ifBlank { "not prepared yet" }}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -879,6 +997,25 @@ private fun ServicesScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    Text(
+                            text = "Diagnostics log: ${ubuntuRuntime.diagnosticsPath.ifBlank { "not generated yet" }}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (ubuntuRuntime.diagnosticsPreview.isNotBlank()) {
+                        Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = Color(0xFF101922)
+                        ) {
+                            Text(
+                                    modifier = Modifier.padding(12.dp),
+                                    text = ubuntuRuntime.diagnosticsPreview,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color(0xFFB9D7B0),
+                                    style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
                                 onClick = onPrepareUbuntuRuntime,
@@ -1027,6 +1164,30 @@ private fun ServicesScreen(
                 }
             }
         }
+    }
+}
+
+private fun buildPrompt(
+        runtime: TerminalRuntimeSummary,
+        ubuntuRuntime: UbuntuRuntimeSummary,
+        currentDirectory: String
+): String {
+    val (user, homePath) = when (runtime.kind) {
+        TerminalBackendKind.UBUNTU_2204 -> ubuntuRuntime.defaultUsername to ubuntuRuntime.guestHomePath
+        TerminalBackendKind.ANDROID_LOCAL -> "android" to runtime.homeDirectory
+    }
+
+    return "$user@phone:${formatPromptPath(currentDirectory, homePath)}\$"
+}
+
+private fun formatPromptPath(
+        currentDirectory: String,
+        homePath: String
+): String {
+    return when {
+        currentDirectory == homePath -> "~"
+        currentDirectory.startsWith("$homePath/") -> "~/${currentDirectory.removePrefix("$homePath/")}"
+        else -> currentDirectory
     }
 }
 

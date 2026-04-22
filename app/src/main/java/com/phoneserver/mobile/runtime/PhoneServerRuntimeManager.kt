@@ -58,7 +58,7 @@ object PhoneServerRuntimeManager {
             TerminalRuntimeSnapshot(
                     kind = TerminalBackendKind.ANDROID_LOCAL,
                     displayName = "Android local shell",
-                    detail = "Runs commands through /system/bin/sh inside the app sandbox.",
+                    detail = "Runs commands through a persistent PTY-backed /system/bin/sh session inside the app sandbox.",
                     homeDirectory = "",
                     commandHint = "Use pwd, ls, mkdir, cat, echo, touch, cp, mv, rm, or app-local scripts."
             )
@@ -74,11 +74,15 @@ object PhoneServerRuntimeManager {
                     runtimeRootPath = "",
                     rootfsPath = "",
                     homePath = "",
+                    guestHomePath = "/root",
+                    guestWorkspacePath = "/workspace",
+                    defaultUsername = "root",
                     cachePath = "",
                     archivePath = "",
                     archiveFileName = "",
                     prootPath = "",
                     runtimeLauncherPath = "",
+                    diagnosticsPath = "",
                     sourceUrl = "",
                     sourcePageUrl = "",
                     expectedSha256 = "",
@@ -134,6 +138,11 @@ object PhoneServerRuntimeManager {
             )
             terminalHistoryStore = TerminalHistoryStore(appContext)
             _ubuntuRuntime.value = ubuntuSnapshot
+            activeTerminalBackendKind = if (ubuntuSnapshot.backendReady) {
+                TerminalBackendKind.UBUNTU_2204
+            } else {
+                TerminalBackendKind.ANDROID_LOCAL
+            }
             publishTerminalRuntimeLocked()
             initialized = true
         }
@@ -164,6 +173,28 @@ object PhoneServerRuntimeManager {
         return result
     }
 
+    suspend fun resizeTerminal(
+            columns: Int,
+            rows: Int
+    ) {
+        requireActiveTerminalBackend().resize(columns, rows)
+    }
+
+    suspend fun interruptTerminal(): RuntimeActionResult {
+        val interrupted = requireActiveTerminalBackend().interrupt()
+        return if (interrupted) {
+            RuntimeActionResult(
+                    success = true,
+                    message = "Sent Ctrl+C to the active PTY session."
+            )
+        } else {
+            RuntimeActionResult(
+                    success = false,
+                    message = "No active PTY session was available to interrupt."
+            )
+        }
+    }
+
     suspend fun prepareUbuntuRuntime(): UbuntuRuntimeSnapshot = runtimeMutex.withLock {
         val snapshot = ubuntuRuntimeCoordinator.prepareScaffold()
         publishUbuntuSnapshotLocked(snapshot)
@@ -184,11 +215,7 @@ object PhoneServerRuntimeManager {
         if (currentSnapshot.phase == UbuntuInstallPhase.READY && currentSnapshot.rootfsPath.isNotBlank()) {
             return@withLock RuntimeActionResult(
                     success = true,
-                    message = if (currentSnapshot.backendReady) {
-                        "Ubuntu Base and the bundled proot launcher are already ready."
-                    } else {
-                        "Ubuntu Base is already staged locally, but the bundled Ubuntu launcher is still unavailable."
-                    }
+                    message = "Ubuntu Base and the verified proot launcher are already ready."
             )
         }
 
@@ -228,7 +255,7 @@ object PhoneServerRuntimeManager {
 
         RuntimeActionResult(
                 success = true,
-                message = "Ubuntu rootfs install started for ${source.architecture}. Keep the app open while the archive downloads and extracts."
+                message = "Ubuntu rootfs install started for ${source.architecture}. Keep the app open while the archive downloads, extracts, and runs boot verification."
         )
     }
 
@@ -257,11 +284,12 @@ object PhoneServerRuntimeManager {
                                     "Ubuntu scaffold is ready. Install Ubuntu Base first."
 
                                 UbuntuInstallPhase.DOWNLOADING_ROOTFS,
-                                UbuntuInstallPhase.EXTRACTING_ROOTFS ->
+                                UbuntuInstallPhase.EXTRACTING_ROOTFS,
+                                UbuntuInstallPhase.VERIFYING_BOOT ->
                                     "Ubuntu setup is still in progress."
 
                                 UbuntuInstallPhase.READY ->
-                                    "Ubuntu Base is staged locally, but the Ubuntu launcher is still unavailable."
+                                    "Ubuntu Base is installed, but the verified launcher state is inconsistent. Check the runtime diagnostics."
 
                                 UbuntuInstallPhase.FAILED ->
                                     ubuntu.errorMessage ?: "Ubuntu runtime setup failed."
@@ -272,7 +300,7 @@ object PhoneServerRuntimeManager {
                     publishTerminalRuntimeLocked()
                     RuntimeSwitchResult(
                             success = true,
-                            message = "Terminal runtime switched to Ubuntu 22.04."
+                            message = "Terminal runtime switched to Ubuntu 22.04. New sessions boot through /bin/bash --login."
                     )
                 }
             }

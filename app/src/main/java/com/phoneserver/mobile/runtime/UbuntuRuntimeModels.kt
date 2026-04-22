@@ -5,6 +5,7 @@ enum class UbuntuInstallPhase {
     SCAFFOLD_READY,
     DOWNLOADING_ROOTFS,
     EXTRACTING_ROOTFS,
+    VERIFYING_BOOT,
     READY,
     FAILED
 }
@@ -30,11 +31,15 @@ data class UbuntuRuntimeSnapshot(
         val runtimeRootPath: String,
         val rootfsPath: String,
         val homePath: String,
+        val guestHomePath: String,
+        val guestWorkspacePath: String,
+        val defaultUsername: String,
         val cachePath: String,
         val archivePath: String,
         val archiveFileName: String,
         val prootPath: String,
         val runtimeLauncherPath: String,
+        val diagnosticsPath: String,
         val sourceUrl: String,
         val sourcePageUrl: String,
         val expectedSha256: String,

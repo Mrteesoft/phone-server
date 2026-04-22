@@ -9,7 +9,9 @@ class UbuntuProotBackend(
 ) : TerminalBackend {
 
     private var session: PtyTerminalSession? = null
-    private var sessionLauncherPath: String = ""
+    private var sessionKey: String = ""
+    private var pendingColumns: Int = DEFAULT_COLUMNS
+    private var pendingRows: Int = DEFAULT_ROWS
 
     override val kind: TerminalBackendKind = TerminalBackendKind.UBUNTU_2204
     override val displayName: String = "Ubuntu 22.04 userspace"
@@ -17,9 +19,11 @@ class UbuntuProotBackend(
         get() = runtimeSnapshotProvider().detail
     override val homeDirectory: File
         get() = File(runtimeSnapshotProvider().homePath)
-    override val commandHint: String = "Run apt, bash, python3, git, and other Ubuntu userspace commands."
-    override val displayHomeDirectory: String = "/root"
-    override val defaultWorkingDirectory: String = "/root"
+    override val commandHint: String = "Real Ubuntu userspace. Run apt, sudo, python3, git, curl, ssh, and login-shell commands directly."
+    override val displayHomeDirectory: String
+        get() = runtimeSnapshotProvider().guestHomePath
+    override val defaultWorkingDirectory: String
+        get() = runtimeSnapshotProvider().guestHomePath
 
     override suspend fun isAvailable(): Boolean = runtimeSnapshotProvider().backendReady
 
@@ -30,15 +34,9 @@ class UbuntuProotBackend(
             timeoutSeconds: Int,
             onOutputLine: (String) -> Unit
     ): TerminalCommandResult {
-        val normalizedCommand = normalizeCommand(command)
-                ?: return TerminalCommandResult(
-                        output = "Ubuntu userspace already runs as root inside proot. Run the command directly without sudo.",
-                        currentDirectory = homeDirectory,
-                        exitCode = 0
-                )
         val snapshot = runtimeSnapshotProvider()
         if (!snapshot.backendReady || snapshot.runtimeLauncherPath.isBlank()) {
-            return unavailableResult(snapshot, normalizedCommand)
+            return unavailableResult(snapshot, command)
         }
 
         val launcher = File(snapshot.runtimeLauncherPath)
@@ -57,7 +55,7 @@ class UbuntuProotBackend(
                         exitCode = 127
                 )
 
-        return terminalSession.execute(normalizedCommand, timeoutSeconds, onOutputLine)
+        return terminalSession.execute(command, timeoutSeconds, onOutputLine)
     }
 
     override suspend fun changeDirectory(
@@ -111,10 +109,9 @@ class UbuntuProotBackend(
                 resolveHostShellPath(),
                 launcher.absolutePath,
                 "/bin/bash",
-                "--noprofile",
-                "--norc",
+                "--login",
                 "-lc",
-                "cd ${runtimeDirectory.shellQuoted()} && $command"
+                "cd ${runtimeDirectory.shellQuoted()} && exec $command"
         ).directory(hostWorkingDirectory)
                 .redirectErrorStream(true)
                 .start()
@@ -128,22 +125,32 @@ class UbuntuProotBackend(
     override suspend fun close() {
         session?.close()
         session = null
-        sessionLauncherPath = ""
+        sessionKey = ""
+    }
+
+    override suspend fun resize(columns: Int, rows: Int) {
+        pendingColumns = columns.coerceAtLeast(MIN_COLUMNS)
+        pendingRows = rows.coerceAtLeast(MIN_ROWS)
+        session?.resize(pendingColumns, pendingRows)
+    }
+
+    override suspend fun interrupt(): Boolean {
+        return session?.interruptForegroundProcess() ?: false
     }
 
     private suspend fun ensureSession(snapshot: UbuntuRuntimeSnapshot): PtyTerminalSession? {
-        val launcherPath = snapshot.runtimeLauncherPath
+        val launcherKey = "${snapshot.runtimeLauncherPath}:${snapshot.lastUpdatedAt}:${snapshot.guestHomePath}"
         val existingSession = session
-        if (existingSession != null && sessionLauncherPath == launcherPath) {
+        if (existingSession != null && sessionKey == launcherKey) {
             return existingSession
         }
 
         existingSession?.close()
 
-        val launcher = File(launcherPath)
+        val launcher = File(snapshot.runtimeLauncherPath)
         if (!launcher.exists()) {
             session = null
-            sessionLauncherPath = ""
+            sessionKey = ""
             return null
         }
 
@@ -152,13 +159,17 @@ class UbuntuProotBackend(
         ) {
             PtyLaunchConfiguration(
                     argv = listOf(resolveHostShellPath(), launcher.absolutePath),
-                    environment = mapOf("TERM" to "xterm-256color"),
+                    environment = mapOf(
+                            "TERM" to "xterm-256color",
+                            "LANG" to "C.UTF-8"
+                    ),
                     workingDirectory = homeDirectory
             )
         }
+        newSession.resize(pendingColumns, pendingRows)
 
         session = newSession
-        sessionLauncherPath = launcherPath
+        sessionKey = launcherKey
         return newSession
     }
 
@@ -185,7 +196,8 @@ class UbuntuProotBackend(
                 "Ubuntu scaffold is ready. Install Ubuntu Base from the Services tab first."
 
             UbuntuInstallPhase.DOWNLOADING_ROOTFS,
-            UbuntuInstallPhase.EXTRACTING_ROOTFS ->
+            UbuntuInstallPhase.EXTRACTING_ROOTFS,
+            UbuntuInstallPhase.VERIFYING_BOOT ->
                 "Ubuntu setup is still in progress. Wait for the rootfs preparation to finish before running `${command}`."
 
             UbuntuInstallPhase.READY ->
@@ -196,19 +208,6 @@ class UbuntuProotBackend(
         }
     }
 
-    private fun normalizeCommand(command: String): String? {
-        val trimmed = command.trim()
-        if (trimmed == "sudo") {
-            return null
-        }
-
-        return if (trimmed.startsWith("sudo ")) {
-            trimmed.removePrefix("sudo ").trimStart()
-        } else {
-            trimmed
-        }
-    }
-
     private fun resolveHostShellPath(): String {
         val candidates = listOf("/system/bin/sh", "/system/xbin/sh", "sh")
         return candidates.firstOrNull { candidate -> candidate == "sh" || File(candidate).exists() }
@@ -216,4 +215,11 @@ class UbuntuProotBackend(
     }
 
     private fun String.shellQuoted(): String = "'" + replace("'", "'\"'\"'") + "'"
+
+    private companion object {
+        const val DEFAULT_COLUMNS = 120
+        const val DEFAULT_ROWS = 40
+        const val MIN_COLUMNS = 40
+        const val MIN_ROWS = 16
+    }
 }

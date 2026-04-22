@@ -13,6 +13,7 @@ import com.phoneserver.mobile.runtime.UbuntuRuntimeSnapshot
 import com.phoneserver.mobile.runtime.WorkspaceManager
 import com.phoneserver.mobile.storage.TerminalHistoryStore
 import java.io.File
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -75,6 +76,10 @@ data class UbuntuRuntimeSummary(
         val archivePath: String,
         val sourceUrl: String,
         val workspaceMountPath: String,
+        val guestHomePath: String,
+        val defaultUsername: String,
+        val diagnosticsPath: String,
+        val diagnosticsPreview: String,
         val backendReady: Boolean,
         val progressLabel: String,
         val canPrepare: Boolean,
@@ -109,6 +114,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
     private var pendingUbuntuAutoSwitch = false
     private var hasObservedUbuntuRuntime = false
     private var lastUbuntuRuntimeEventKey: String? = null
+    private var lastObservedRuntimeKind: TerminalBackendKind = TerminalBackendKind.ANDROID_LOCAL
 
     private val _uiState = MutableStateFlow(
             PhoneServerUiState(
@@ -127,7 +133,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                     terminalRuntime = TerminalRuntimeSummary(
                             kind = TerminalBackendKind.ANDROID_LOCAL,
                             displayName = "Android local shell",
-                            detail = "Runs commands through /system/bin/sh inside the app sandbox.",
+                            detail = "Runs commands through a persistent PTY-backed /system/bin/sh session inside the app sandbox.",
                             homeDirectory = workspaceManager.rootDirectory().absolutePath,
                             commandHint = "Use pwd, ls, mkdir, cat, echo, touch, cp, mv, rm, or app-local scripts."
                     ),
@@ -140,6 +146,10 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                             archivePath = "",
                             sourceUrl = "",
                             workspaceMountPath = workspaceManager.rootDirectory().absolutePath,
+                            guestHomePath = "/root",
+                            defaultUsername = "root",
+                            diagnosticsPath = "",
+                            diagnosticsPreview = "",
                             backendReady = false,
                             progressLabel = "",
                             canPrepare = false,
@@ -190,10 +200,31 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             PhoneServerRuntimeManager.terminalRuntime.collect { snapshot ->
                 _uiState.update { current ->
+                    val mappedDirectory = when {
+                        snapshot.kind == lastObservedRuntimeKind -> current.currentDirectory
+                        snapshot.kind == TerminalBackendKind.UBUNTU_2204 &&
+                                current.currentDirectory == workspaceManager.rootDirectory().absolutePath -> snapshot.homeDirectory
+                        else -> PhoneServerRuntimeManager.remapDisplayedPathForRuntimeSwitch(
+                                path = current.currentDirectory,
+                                sourceKind = lastObservedRuntimeKind,
+                                targetKind = snapshot.kind
+                        )
+                    }
+
                     current.copy(
-                            terminalRuntime = mapTerminalRuntime(snapshot)
+                            currentDirectory = mappedDirectory,
+                            terminalRuntime = mapTerminalRuntime(snapshot),
+                            services = buildServices(
+                                    workspaceCount = current.workspaces.size,
+                                    currentDirectory = mappedDirectory,
+                                    runningCommand = current.runningCommand,
+                                    managedServiceCount = current.managedServices.count { it.status == "RUNNING" },
+                                    runtimeServiceActive = PhoneServerRuntimeManager.runtimeServiceActive.value,
+                                    runtimeName = snapshot.displayName
+                            )
                     )
                 }
+                lastObservedRuntimeKind = snapshot.kind
             }
         }
 
@@ -278,6 +309,25 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
         _uiState.update { current -> current.copy(terminalLines = emptyList()) }
     }
 
+    fun resizeTerminal(
+            columns: Int,
+            rows: Int
+    ) {
+        viewModelScope.launch {
+            PhoneServerRuntimeManager.resizeTerminal(columns, rows)
+        }
+    }
+
+    fun interruptTerminal() {
+        viewModelScope.launch {
+            val result = PhoneServerRuntimeManager.interruptTerminal()
+            appendLine(
+                    kind = if (result.success) TerminalLineKind.STATUS else TerminalLineKind.ERROR,
+                    text = result.message
+            )
+        }
+    }
+
     fun runCommand(rawCommand: String) {
         val command = rawCommand.trim()
         val runtime = _uiState.value.terminalRuntime.kind
@@ -285,7 +335,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
             return
         }
         if (isRootOnlyCommand(command) && runtime == TerminalBackendKind.ANDROID_LOCAL) {
-            appendLine(TerminalLineKind.COMMAND, "$ ${command}")
+            appendLine(TerminalLineKind.COMMAND, "${currentPromptPrefix()} ${command}")
             appendLine(
                     TerminalLineKind.ERROR,
                     buildRootOnlyCommandUnavailableMessage(command, _uiState.value.ubuntuRuntime)
@@ -294,7 +344,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
         }
         if (isLinuxUserspaceCommand(command) &&
                 runtime == TerminalBackendKind.ANDROID_LOCAL) {
-            appendLine(TerminalLineKind.COMMAND, "$ ${command}")
+            appendLine(TerminalLineKind.COMMAND, "${currentPromptPrefix()} ${command}")
             appendLine(
                     TerminalLineKind.ERROR,
                     buildUserspaceCommandUnavailableMessage(command, _uiState.value.ubuntuRuntime)
@@ -306,7 +356,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
             return
         }
 
-        appendLine(TerminalLineKind.COMMAND, "$ ${command}")
+        appendLine(TerminalLineKind.COMMAND, "${currentPromptPrefix()} ${command}")
         setCommandRunning(true)
 
         viewModelScope.launch {
@@ -432,6 +482,24 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
             current.copy(
                     terminalLines = current.terminalLines + TerminalLine(nextLineId.getAndIncrement(), kind, text)
             )
+        }
+    }
+
+    private fun currentPromptPrefix(): String {
+        val current = _uiState.value
+        return when (current.terminalRuntime.kind) {
+            TerminalBackendKind.ANDROID_LOCAL -> "android@phone:${current.currentDirectory}\$"
+            TerminalBackendKind.UBUNTU_2204 -> {
+                val homePath = current.ubuntuRuntime.guestHomePath
+                val promptPath = when {
+                    current.currentDirectory == homePath -> "~"
+                    current.currentDirectory.startsWith("$homePath/") ->
+                        "~/${current.currentDirectory.removePrefix("$homePath/")}"
+
+                    else -> current.currentDirectory
+                }
+                "${current.ubuntuRuntime.defaultUsername}@phone:${promptPath}\$"
+            }
         }
     }
 
@@ -595,14 +663,15 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                 "$prefix The Ubuntu scaffold exists, but Ubuntu Base is not installed yet. Open Services and press Install Ubuntu."
 
             UbuntuInstallPhase.DOWNLOADING_ROOTFS.name,
-            UbuntuInstallPhase.EXTRACTING_ROOTFS.name ->
+            UbuntuInstallPhase.EXTRACTING_ROOTFS.name,
+            UbuntuInstallPhase.VERIFYING_BOOT.name ->
                 "$prefix Ubuntu setup is still running in the background. Wait for installation to finish before trying Linux package commands."
 
             UbuntuInstallPhase.READY.name ->
                 if (ubuntuRuntime.backendReady) {
                     "$prefix Ubuntu 22.04 is ready, but this screen is still attached to the Android local shell. Open Services and switch the terminal runtime to Ubuntu first."
                 } else {
-                    "$prefix Ubuntu Base is staged locally, but the Ubuntu launcher is still unavailable. Until that launcher is ready, apt-style commands cannot run here."
+                    "$prefix Ubuntu rootfs exists locally, but boot verification has not passed yet. Check the runtime diagnostics and repair the Ubuntu setup."
                 }
 
             UbuntuInstallPhase.FAILED.name ->
@@ -640,9 +709,9 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                 TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.OUTPUT, "Phone Server terminal"),
                 TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.STATUS, "Local-only runtime. No account. No external control plane."),
                 TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.STATUS, "Workspace root: ${rootDirectory.absolutePath}"),
-                TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.STATUS, "Tap anywhere to type. Press enter or tap run. Shell directory changes survive between commands."),
-                TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.STATUS, "Root-only commands such as sudo require a rooted device or a userspace distro."),
-                TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.STATUS, "This screen starts in the Android local shell. Ubuntu commands such as apt do not work here yet.")
+                TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.STATUS, "Tap anywhere to type. Press enter or tap run. Commands execute through the active PTY-backed shell runtime."),
+                TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.STATUS, "When Ubuntu boot verification passes, the terminal switches to Ubuntu by default on launch."),
+                TerminalLine(nextLineId.getAndIncrement(), TerminalLineKind.STATUS, "Runtime diagnostics and install progress are streamed here.")
         )
 
         val historyLines = terminalHistoryStore.loadRecent(limit = 12).flatMap { record ->
@@ -668,8 +737,12 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
             currentDirectory: String,
             runningCommand: Boolean,
             managedServiceCount: Int,
-            runtimeServiceActive: Boolean
+            runtimeServiceActive: Boolean,
+            runtimeName: String = ""
     ): List<ServiceSummary> {
+        val resolvedRuntimeName = runtimeName.ifBlank {
+            _uiState.value.terminalRuntime.displayName.ifBlank { "the active shell backend" }
+        }
         return listOf(
                 ServiceSummary(
                         name = "Runtime service",
@@ -683,7 +756,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                 ServiceSummary(
                         name = "Shell runtime",
                         status = if (runningCommand) "Busy" else "Ready",
-                        detail = "Commands run through a persistent local shell session."
+                        detail = "Commands run through $resolvedRuntimeName using a persistent shell session."
                 ),
                 ServiceSummary(
                         name = "Workspace store",
@@ -728,7 +801,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun mapUbuntuRuntime(snapshot: UbuntuRuntimeSnapshot): UbuntuRuntimeSummary {
         val canPrepare = snapshot.sourceUrl.isNotBlank() &&
-                (snapshot.phase == UbuntuInstallPhase.NOT_INSTALLED || snapshot.phase == UbuntuInstallPhase.FAILED)
+                snapshot.phase == UbuntuInstallPhase.NOT_INSTALLED
         val canInstall = snapshot.sourceUrl.isNotBlank() &&
                 (snapshot.phase == UbuntuInstallPhase.SCAFFOLD_READY || snapshot.phase == UbuntuInstallPhase.FAILED)
 
@@ -741,6 +814,10 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                 archivePath = snapshot.archivePath,
                 sourceUrl = snapshot.sourceUrl,
                 workspaceMountPath = snapshot.workspaceMountPath,
+                guestHomePath = snapshot.guestHomePath,
+                defaultUsername = snapshot.defaultUsername,
+                diagnosticsPath = snapshot.diagnosticsPath,
+                diagnosticsPreview = loadDiagnosticsPreview(snapshot.diagnosticsPath),
                 backendReady = snapshot.backendReady,
                 progressLabel = buildUbuntuProgressLabel(snapshot),
                 canPrepare = canPrepare,
@@ -750,7 +827,8 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                     UbuntuInstallPhase.FAILED -> "Repair Ubuntu"
                     UbuntuInstallPhase.READY -> "Installed"
                     UbuntuInstallPhase.DOWNLOADING_ROOTFS,
-                    UbuntuInstallPhase.EXTRACTING_ROOTFS -> "Installing..."
+                    UbuntuInstallPhase.EXTRACTING_ROOTFS,
+                    UbuntuInstallPhase.VERIFYING_BOOT -> "Installing..."
                     else -> "Install Ubuntu"
                 }
         )
@@ -772,6 +850,8 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                     "Archive downloaded, extraction in progress"
                 }
             }
+
+            UbuntuInstallPhase.VERIFYING_BOOT -> "Running boot checks and login-shell diagnostics"
 
             UbuntuInstallPhase.READY -> if (snapshot.totalBytes > 0L) {
                 "Archive cached: ${formatBytes(snapshot.totalBytes)}"
@@ -804,6 +884,13 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
 
             UbuntuInstallPhase.EXTRACTING_ROOTFS -> buildUbuntuExtractionEvent(snapshot)
 
+            UbuntuInstallPhase.VERIFYING_BOOT ->
+                UbuntuRuntimeTerminalEvent(
+                        key = "ubuntu-verify:${snapshot.detail}",
+                        kind = TerminalLineKind.STATUS,
+                        message = snapshot.detail
+                )
+
             UbuntuInstallPhase.READY ->
                 UbuntuRuntimeTerminalEvent(
                         key = "ubuntu-ready:${snapshot.detail}:${snapshot.backendReady}",
@@ -815,7 +902,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                 UbuntuRuntimeTerminalEvent(
                         key = "ubuntu-failed:${snapshot.errorMessage ?: snapshot.detail}",
                         kind = TerminalLineKind.ERROR,
-                        message = "Ubuntu install failed: ${snapshot.errorMessage ?: snapshot.detail}"
+                        message = "Ubuntu runtime failed: ${snapshot.errorMessage ?: snapshot.detail}"
                 )
         }
     }
@@ -881,5 +968,18 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
             index += 1
         }
         return String.format("%.1f %s", value, units[index])
+    }
+
+    private fun loadDiagnosticsPreview(path: String): String {
+        val diagnosticsFile = path.takeIf { it.isNotBlank() }?.let(::File) ?: return ""
+        if (!diagnosticsFile.exists() || !diagnosticsFile.isFile) {
+            return ""
+        }
+
+        return runCatching {
+            diagnosticsFile.readLines(StandardCharsets.UTF_8)
+                    .takeLast(12)
+                    .joinToString("\n")
+        }.getOrDefault("")
     }
 }

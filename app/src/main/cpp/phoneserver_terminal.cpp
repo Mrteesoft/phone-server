@@ -171,3 +171,27 @@ Java_com_phoneserver_mobile_runtime_PtyBridge_nativeSignal(
     throwIOException(env, std::string("kill failed: ") + strerror(errno));
     return JNI_FALSE;
 }
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_phoneserver_mobile_runtime_PtyBridge_nativeResize(
+        JNIEnv* env,
+        jobject /* this */,
+        jint masterFdValue,
+        jint columns,
+        jint rows) {
+    struct winsize windowSize {};
+    windowSize.ws_col = static_cast<unsigned short>(columns > 0 ? columns : 120);
+    windowSize.ws_row = static_cast<unsigned short>(rows > 0 ? rows : 40);
+
+    const int result = ioctl(masterFdValue, TIOCSWINSZ, &windowSize);
+    if (result == 0) {
+        return JNI_TRUE;
+    }
+    if (errno == EBADF || errno == ENOTTY) {
+        return JNI_FALSE;
+    }
+
+    throwIOException(env, std::string("ioctl(TIOCSWINSZ) failed: ") + strerror(errno));
+    return JNI_FALSE;
+}

@@ -6,11 +6,20 @@ class AndroidShellBackend(
         override val homeDirectory: File
 ) : TerminalBackend {
 
-    private val session = PersistentTerminalSession(homeDirectory)
+    private val session = PtyTerminalSession(homeDirectory) {
+        PtyLaunchConfiguration(
+                argv = listOf(resolveShellPath()),
+                environment = mapOf(
+                        "HOME" to homeDirectory.absolutePath,
+                        "TERM" to "xterm-256color"
+                ),
+                workingDirectory = homeDirectory
+        )
+    }
 
     override val kind: TerminalBackendKind = TerminalBackendKind.ANDROID_LOCAL
     override val displayName: String = "Android local shell"
-    override val detail: String = "Runs commands through /system/bin/sh inside the app sandbox."
+    override val detail: String = "Runs commands through a persistent PTY-backed /system/bin/sh session inside the app sandbox."
     override val commandHint: String = "Use pwd, ls, mkdir, cat, echo, touch, cp, mv, rm, or app-local scripts."
 
     override fun mapWorkspacePath(hostPath: String): String {
@@ -51,6 +60,12 @@ class AndroidShellBackend(
                 workingDirectory = targetDirectory.absolutePath
         )
     }
+
+    override suspend fun resize(columns: Int, rows: Int) {
+        session.resize(columns, rows)
+    }
+
+    override suspend fun interrupt(): Boolean = session.interruptForegroundProcess()
 
     override suspend fun close() {
         session.close()

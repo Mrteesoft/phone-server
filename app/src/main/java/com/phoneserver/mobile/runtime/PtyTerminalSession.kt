@@ -38,6 +38,8 @@ internal class PtyTerminalSession(
     private val sessionMutex = Mutex()
     private var shellSession: PtyShellSession? = null
     private var lastKnownDirectory: File = homeDirectory.canonicalOrSelf()
+    private var terminalColumns: Int = DEFAULT_COLUMNS
+    private var terminalRows: Int = DEFAULT_ROWS
 
     suspend fun execute(
             command: String,
@@ -98,6 +100,39 @@ internal class PtyTerminalSession(
     suspend fun close() = withContext(Dispatchers.IO) {
         sessionMutex.withLock {
             destroySession()
+        }
+    }
+
+    suspend fun resize(
+            columns: Int,
+            rows: Int
+    ) = withContext(Dispatchers.IO) {
+        val normalizedColumns = columns.coerceAtLeast(MIN_COLUMNS)
+        val normalizedRows = rows.coerceAtLeast(MIN_ROWS)
+
+        sessionMutex.withLock {
+            terminalColumns = normalizedColumns
+            terminalRows = normalizedRows
+            shellSession?.let { session ->
+                runCatching {
+                    PtyBridge.resize(
+                            masterFd = session.process.masterFd,
+                            columns = normalizedColumns,
+                            rows = normalizedRows
+                    )
+                }
+            }
+        }
+    }
+
+    suspend fun interruptForegroundProcess(): Boolean = withContext(Dispatchers.IO) {
+        sessionMutex.withLock {
+            val session = shellSession ?: return@withLock false
+            return@withLock runCatching {
+                session.writer.write(CTRL_C)
+                session.writer.flush()
+                true
+            }.getOrDefault(false)
         }
     }
 
@@ -206,7 +241,9 @@ internal class PtyTerminalSession(
             val process = PtyBridge.start(
                     argv = configuration.argv,
                     environment = configuration.environment,
-                    workingDirectory = workingDirectory.absolutePath
+                    workingDirectory = workingDirectory.absolutePath,
+                    columns = terminalColumns,
+                    rows = terminalRows
             )
             val descriptor = ParcelFileDescriptor.adoptFd(process.masterFd)
             val inputStream = FileInputStream(descriptor.fileDescriptor)
@@ -273,4 +310,12 @@ internal class PtyTerminalSession(
     private fun File.canonicalOrSelf(): File = runCatching { canonicalFile }.getOrElse { this }
 
     private fun String.shellQuoted(): String = "'" + replace("'", "'\"'\"'") + "'"
+
+    private companion object {
+        const val DEFAULT_COLUMNS = 120
+        const val DEFAULT_ROWS = 40
+        const val MIN_COLUMNS = 40
+        const val MIN_ROWS = 16
+        const val CTRL_C = 3
+    }
 }

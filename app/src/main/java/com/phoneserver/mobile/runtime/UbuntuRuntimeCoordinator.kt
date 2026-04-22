@@ -11,24 +11,35 @@ class UbuntuRuntimeCoordinator(
 ) {
 
     private val appContext = context.applicationContext
-    private val runtimeRoot = File(appContext.filesDir, "distros/ubuntu-22.04").apply { mkdirs() }
-    private val rootfsDirectory = File(runtimeRoot, "rootfs")
-    private val homeDirectory = File(runtimeRoot, "home")
-    private val cacheDirectory = File(runtimeRoot, "cache")
-    private val workspaceMountDirectory = File(appContext.filesDir, "workspaces").apply { mkdirs() }
-    private val prootRuntimeDirectory = File(runtimeRoot, "proot-runtime")
-    private val commandShimDirectory = File(runtimeRoot, "command-shims")
-    private val launcherScript = File(runtimeRoot, "start-ubuntu.sh")
-    private val runtimeNote = File(runtimeRoot, "ubuntu-runtime.txt")
+    private val layout = UbuntuRuntimeLayout(
+            runtimeRoot = File(appContext.filesDir, "distros/ubuntu-22.04"),
+            rootfsDirectory = File(appContext.filesDir, "distros/ubuntu-22.04/rootfs"),
+            persistentHomeDirectory = File(appContext.filesDir, "distros/ubuntu-22.04/home"),
+            cacheDirectory = File(appContext.filesDir, "distros/ubuntu-22.04/cache"),
+            workspaceMountDirectory = File(appContext.filesDir, "workspaces"),
+            prootRuntimeDirectory = File(appContext.filesDir, "distros/ubuntu-22.04/proot-runtime"),
+            commandShimDirectory = File(appContext.filesDir, "distros/ubuntu-22.04/command-shims"),
+            diagnosticsDirectory = File(appContext.filesDir, "distros/ubuntu-22.04/diagnostics"),
+            launcherScript = File(appContext.filesDir, "distros/ubuntu-22.04/start-ubuntu.sh"),
+            runtimeNote = File(appContext.filesDir, "distros/ubuntu-22.04/ubuntu-runtime.txt"),
+            bootLogFile = File(appContext.filesDir, "distros/ubuntu-22.04/diagnostics/boot.log")
+    )
     private val store = UbuntuRuntimeStore(appContext)
+    private val bootstrap = UbuntuRuntimeBootstrap(layout)
 
     fun initialize(): UbuntuRuntimeSnapshot {
-        ensureDirectories()
+        bootstrap.ensureHostDirectories()
         val source = resolveRootfsSource()
         val persisted = store.load()
 
         val snapshot = when {
             source == null -> unsupportedArchitectureSnapshot()
+
+            rootfsLooksInstalled() -> buildInstalledRuntimeSnapshot(
+                    source = source,
+                    archiveBytes = archiveFileFor(source).length().coerceAtLeast(0L)
+            )
+
             persisted == null -> buildSnapshot(
                     source = source,
                     phase = UbuntuInstallPhase.NOT_INSTALLED,
@@ -37,49 +48,44 @@ class UbuntuRuntimeCoordinator(
                     totalBytes = 0L
             )
 
-            persisted.phase == UbuntuInstallPhase.DOWNLOADING_ROOTFS ||
-                    persisted.phase == UbuntuInstallPhase.EXTRACTING_ROOTFS -> buildSnapshot(
+            persisted.phase in setOf(
+                    UbuntuInstallPhase.DOWNLOADING_ROOTFS,
+                    UbuntuInstallPhase.EXTRACTING_ROOTFS,
+                    UbuntuInstallPhase.VERIFYING_BOOT
+            ) -> buildSnapshot(
                     source = source,
                     phase = UbuntuInstallPhase.FAILED,
-                    detail = "The previous Ubuntu install was interrupted. Run the install step again to continue.",
+                    detail = "The previous Ubuntu install did not finish cleanly. Run Install Ubuntu again to rebuild the runtime.",
                     downloadedBytes = persisted.downloadedBytes,
                     totalBytes = persisted.totalBytes,
-                    errorMessage = "Ubuntu rootfs setup was interrupted before completion."
+                    errorMessage = "Ubuntu setup was interrupted before runtime verification completed."
             )
 
-            persisted.phase == UbuntuInstallPhase.READY && !rootfsLooksInstalled() -> buildSnapshot(
+            else -> buildSnapshot(
                     source = source,
-                    phase = UbuntuInstallPhase.SCAFFOLD_READY,
-                    detail = "Ubuntu rootfs metadata exists, but the extracted filesystem is missing. Reinstall Ubuntu Base to rebuild it.",
+                    phase = persisted.phase,
+                    detail = persisted.detail.ifBlank {
+                        "Ubuntu scaffold is ready. Install Ubuntu Base to build the local userspace runtime."
+                    },
                     downloadedBytes = persisted.downloadedBytes,
                     totalBytes = persisted.totalBytes,
-                    errorMessage = "Ubuntu rootfs is missing from storage."
+                    errorMessage = persisted.errorMessage
             )
-
-            else -> normalizeSnapshot(source, persisted)
         }
 
-        source?.let(::writePreparationFiles)
+        source?.let { bootstrap.writePreparationFiles(it, resolveBundledRuntime()) }
         return persist(snapshot)
     }
 
     fun prepareScaffold(): UbuntuRuntimeSnapshot {
-        ensureDirectories()
+        bootstrap.ensureHostDirectories()
         val source = resolveRootfsSource() ?: return persist(unsupportedArchitectureSnapshot())
-        writePreparationFiles(source)
+        bootstrap.writePreparationFiles(source, resolveBundledRuntime())
 
-        val bundledRuntime = resolveBundledRuntime()
         val snapshot = if (rootfsLooksInstalled()) {
-            buildSnapshot(
+            buildInstalledRuntimeSnapshot(
                     source = source,
-                    phase = UbuntuInstallPhase.READY,
-                    detail = if (bundledRuntime != null) {
-                        "Ubuntu Base ${source.imageVersion} is staged in app storage. Bundled proot support and the PTY launcher are ready for the Ubuntu terminal."
-                    } else {
-                        "Ubuntu Base ${source.imageVersion} is staged in app storage. Bundled proot support is missing, so the Ubuntu shell cannot launch yet."
-                    },
-                    downloadedBytes = archiveFileFor(source).length().coerceAtLeast(0L),
-                    totalBytes = archiveFileFor(source).length().coerceAtLeast(0L)
+                    archiveBytes = archiveFileFor(source).length().coerceAtLeast(0L)
             )
         } else {
             buildSnapshot(
@@ -106,15 +112,15 @@ class UbuntuRuntimeCoordinator(
     }
 
     fun archiveFileFor(source: UbuntuRootfsSource): File {
-        return File(cacheDirectory, source.fileName)
+        return File(layout.cacheDirectory, source.fileName)
     }
 
-    fun rootfsDirectory(): File = rootfsDirectory
+    fun rootfsDirectory(): File = layout.rootfsDirectory
 
-    fun bundledRuntimeInstallRoot(): File = prootRuntimeDirectory
+    fun bundledRuntimeInstallRoot(): File = layout.prootRuntimeDirectory
 
     fun markDownloadStarting(source: UbuntuRootfsSource): UbuntuRuntimeSnapshot {
-        writePreparationFiles(source)
+        bootstrap.writePreparationFiles(source, resolveBundledRuntime())
         return persist(
                 buildSnapshot(
                         source = source,
@@ -173,22 +179,27 @@ class UbuntuRuntimeCoordinator(
         )
     }
 
-    fun markReady(source: UbuntuRootfsSource): UbuntuRuntimeSnapshot {
-        ensureUbuntuNetworkConfiguration()
-        writePreparationFiles(source)
-        val bundledRuntime = resolveBundledRuntime()
-
+    fun markVerifyingBoot(
+            source: UbuntuRootfsSource,
+            archiveBytes: Long
+    ): UbuntuRuntimeSnapshot {
+        bootstrap.writePreparationFiles(source, resolveBundledRuntime())
         return persist(
                 buildSnapshot(
                         source = source,
-                        phase = UbuntuInstallPhase.READY,
-                        detail = if (bundledRuntime != null) {
-                            "Ubuntu Base ${source.imageVersion} is extracted into app storage. The bundled proot runtime and PTY launcher are ready."
-                        } else {
-                            "Ubuntu Base ${source.imageVersion} is extracted into app storage, but bundled proot support was not found in the app assets."
-                        },
-                        downloadedBytes = archiveFileFor(source).length().coerceAtLeast(0L),
-                        totalBytes = archiveFileFor(source).length().coerceAtLeast(0L)
+                        phase = UbuntuInstallPhase.VERIFYING_BOOT,
+                        detail = "Launching Ubuntu through proot to verify the login shell, environment, and writable temp directories.",
+                        downloadedBytes = archiveBytes,
+                        totalBytes = archiveBytes
+                )
+        )
+    }
+
+    fun markReady(source: UbuntuRootfsSource): UbuntuRuntimeSnapshot {
+        return persist(
+                buildInstalledRuntimeSnapshot(
+                        source = source,
+                        archiveBytes = archiveFileFor(source).length().coerceAtLeast(0L)
                 )
         )
     }
@@ -196,61 +207,56 @@ class UbuntuRuntimeCoordinator(
     fun markFailure(errorMessage: String): UbuntuRuntimeSnapshot {
         val source = resolveRootfsSource()
         val currentSnapshot = store.load()
-        val snapshot = buildSnapshot(
-                source = source,
-                phase = UbuntuInstallPhase.FAILED,
-                detail = errorMessage,
-                downloadedBytes = currentSnapshot?.downloadedBytes ?: 0L,
-                totalBytes = currentSnapshot?.totalBytes ?: 0L,
-                errorMessage = errorMessage
+        return persist(
+                buildSnapshot(
+                        source = source,
+                        phase = UbuntuInstallPhase.FAILED,
+                        detail = errorMessage,
+                        downloadedBytes = currentSnapshot?.downloadedBytes ?: 0L,
+                        totalBytes = currentSnapshot?.totalBytes ?: 0L,
+                        errorMessage = errorMessage
+                )
         )
-        return persist(snapshot)
     }
 
     fun resetRootfsDirectory() {
-        ensureDirectories()
-        val expectedRoot = runtimeRoot.canonicalFile
-        val actualRootfs = rootfsDirectory.canonicalFile
+        bootstrap.ensureHostDirectories()
+        val expectedRoot = layout.runtimeRoot.canonicalFile
+        val actualRootfs = layout.rootfsDirectory.canonicalFile
         require(actualRootfs.toPath().startsWith(expectedRoot.toPath())) {
             "Refusing to clear an unexpected rootfs path."
         }
-        rootfsDirectory.listFiles()?.forEach { file ->
+        layout.rootfsDirectory.listFiles()?.forEach { file ->
             file.deleteRecursively()
         }
-        rootfsDirectory.mkdirs()
+        layout.rootfsDirectory.mkdirs()
     }
 
-    private fun normalizeSnapshot(
+    private fun buildInstalledRuntimeSnapshot(
             source: UbuntuRootfsSource,
-            persisted: UbuntuRuntimeSnapshot
+            archiveBytes: Long
     ): UbuntuRuntimeSnapshot {
-        val normalizedPhase = if (persisted.phase == UbuntuInstallPhase.READY && !rootfsLooksInstalled()) {
-            UbuntuInstallPhase.SCAFFOLD_READY
+        val bundledRuntime = resolveBundledRuntime()
+        bootstrap.writePreparationFiles(source, bundledRuntime)
+        val verification = bootstrap.verifyBoot(bundledRuntime)
+        return if (verification.success) {
+            buildSnapshot(
+                    source = source,
+                    phase = UbuntuInstallPhase.READY,
+                    detail = verification.detail,
+                    downloadedBytes = archiveBytes,
+                    totalBytes = archiveBytes
+            )
         } else {
-            persisted.phase
+            buildSnapshot(
+                    source = source,
+                    phase = UbuntuInstallPhase.FAILED,
+                    detail = verification.detail,
+                    downloadedBytes = archiveBytes,
+                    totalBytes = archiveBytes,
+                    errorMessage = verification.errorMessage
+            )
         }
-
-        val detail = when {
-            persisted.detail.isBlank() && normalizedPhase == UbuntuInstallPhase.READY && resolveBundledRuntime() != null ->
-                "Ubuntu Base ${source.imageVersion} is staged in app storage and the Ubuntu terminal launcher is ready."
-
-            persisted.detail.isBlank() && normalizedPhase == UbuntuInstallPhase.READY ->
-                "Ubuntu Base ${source.imageVersion} is staged in app storage."
-
-            persisted.detail.isBlank() ->
-                "Ubuntu 22.04 runtime is prepared for local install."
-
-            else -> persisted.detail
-        }
-
-        return buildSnapshot(
-                source = source,
-                phase = normalizedPhase,
-                detail = detail,
-                downloadedBytes = persisted.downloadedBytes,
-                totalBytes = persisted.totalBytes,
-                errorMessage = persisted.errorMessage
-        )
     }
 
     private fun unsupportedArchitectureSnapshot(): UbuntuRuntimeSnapshot {
@@ -276,10 +282,6 @@ class UbuntuRuntimeCoordinator(
         val resolvedSource = source ?: resolveRootfsSource()
         val archiveFile = resolvedSource?.let(::archiveFileFor)
         val bundledRuntime = resolveBundledRuntime()
-        val backendReady = phase == UbuntuInstallPhase.READY &&
-                rootfsLooksInstalled() &&
-                bundledRuntime != null &&
-                launcherScript.exists()
 
         return UbuntuRuntimeSnapshot(
                 releaseLabel = resolvedSource?.releaseLabel ?: "Ubuntu 22.04 LTS",
@@ -288,172 +290,56 @@ class UbuntuRuntimeCoordinator(
                 prootAssetAbi = bundledRuntime?.assetAbi.orEmpty(),
                 phase = phase,
                 detail = detail,
-                runtimeRootPath = runtimeRoot.absolutePath,
-                rootfsPath = rootfsDirectory.absolutePath,
-                homePath = homeDirectory.absolutePath,
-                cachePath = cacheDirectory.absolutePath,
+                runtimeRootPath = layout.runtimeRoot.absolutePath,
+                rootfsPath = layout.rootfsDirectory.absolutePath,
+                homePath = layout.persistentHomeDirectory.absolutePath,
+                guestHomePath = layout.guestHomePath,
+                guestWorkspacePath = layout.guestWorkspacePath,
+                defaultUsername = layout.defaultUsername,
+                cachePath = layout.cacheDirectory.absolutePath,
                 archivePath = archiveFile?.absolutePath.orEmpty(),
                 archiveFileName = resolvedSource?.fileName.orEmpty(),
                 prootPath = bundledRuntime?.prootBinary?.absolutePath.orEmpty(),
-                runtimeLauncherPath = launcherScript.absolutePath.takeIf { launcherScript.exists() }.orEmpty(),
+                runtimeLauncherPath = layout.launcherScript.absolutePath.takeIf { layout.launcherScript.exists() }.orEmpty(),
+                diagnosticsPath = layout.bootLogFile.absolutePath,
                 sourceUrl = resolvedSource?.downloadUrl.orEmpty(),
                 sourcePageUrl = resolvedSource?.sourcePageUrl.orEmpty(),
                 expectedSha256 = resolvedSource?.sha256.orEmpty(),
                 downloadedBytes = downloadedBytes,
                 totalBytes = totalBytes,
-                workspaceMountPath = workspaceMountDirectory.absolutePath,
-                backendReady = backendReady,
+                workspaceMountPath = layout.workspaceMountDirectory.absolutePath,
+                backendReady = phase == UbuntuInstallPhase.READY,
                 lastUpdatedAt = Instant.now().toString(),
                 errorMessage = errorMessage
         )
     }
 
-    private fun ensureDirectories() {
-        runtimeRoot.mkdirs()
-        rootfsDirectory.mkdirs()
-        homeDirectory.mkdirs()
-        cacheDirectory.mkdirs()
-        workspaceMountDirectory.mkdirs()
-        prootRuntimeDirectory.mkdirs()
-        commandShimDirectory.mkdirs()
-    }
-
-    private fun writePreparationFiles(source: UbuntuRootfsSource) {
-        val bundledRuntime = resolveBundledRuntime()
-        if (rootfsLooksInstalled()) {
-            ensureUbuntuNetworkConfiguration()
-        }
-
-        File(homeDirectory, ".phoneserver-profile").writeText(
-                buildString {
-                    appendLine("Phone Server Ubuntu scaffold")
-                    appendLine("Release: ${source.releaseLabel} (${source.codename})")
-                    appendLine("Image version: ${source.imageVersion}")
-                    appendLine("Architecture: ${source.architecture}")
-                    appendLine("Workspace mount target: /workspace")
-                    appendLine("Rootfs cache archive: ${archiveFileFor(source).absolutePath}")
-                    if (bundledRuntime != null) {
-                        appendLine("Bundled proot ABI: ${bundledRuntime.assetAbi}")
-                        appendLine("Bundled proot path: ${bundledRuntime.prootBinary.absolutePath}")
-                    }
-                }
-        )
-
-        writeCommandShims()
-
-        val launcherContents = if (bundledRuntime != null && rootfsLooksInstalled()) {
-            buildLauncherScript(bundledRuntime)
-        } else {
-            buildString {
-                appendLine("#!/system/bin/sh")
-                appendLine("echo \"Ubuntu rootfs path: ${rootfsDirectory.absolutePath}\"")
-                appendLine("echo \"Ubuntu archive: ${archiveFileFor(source).absolutePath}\"")
-                appendLine("echo \"Ubuntu cannot launch yet because the rootfs or bundled proot runtime is still missing.\"")
-            }
-        }
-
-        launcherScript.writeText(launcherContents)
-        launcherScript.setExecutable(true, true)
-
-        runtimeNote.writeText(
-                buildString {
-                    appendLine("Phone Server Ubuntu runtime note")
-                    appendLine("Release: ${source.releaseLabel}")
-                    appendLine("Image source: ${source.downloadUrl}")
-                    appendLine("Source page: ${source.sourcePageUrl}")
-                    appendLine("Expected SHA256: ${source.sha256}")
-                    appendLine("Rootfs path: ${rootfsDirectory.absolutePath}")
-                    appendLine("Launcher path: ${launcherScript.absolutePath}")
-                    appendLine(
-                            if (bundledRuntime != null) {
-                                "Bundled proot asset ABI: ${bundledRuntime.assetAbi}"
-                            } else {
-                                "Bundled proot assets were not found in app storage."
-                            }
-                    )
-                }
-        )
-    }
-
-    private fun buildLauncherScript(runtime: BundledProotRuntime): String {
-        return buildString {
-            appendLine("#!/system/bin/sh")
-            appendLine("set -eu")
-            appendLine("PROOT_BIN=${runtime.prootBinary.absolutePath.shellQuoted()}")
-            appendLine("HOST_LINKER=${runtime.hostLinkerPath.shellQuoted()}")
-            appendLine("PROOT_LOADER_PATH=${runtime.loaderBinary.absolutePath.shellQuoted()}")
-            appendLine("ROOTFS=${rootfsDirectory.absolutePath.shellQuoted()}")
-            appendLine("HOME_BIND=${homeDirectory.absolutePath.shellQuoted()}")
-            appendLine("WORKSPACE_BIND=${workspaceMountDirectory.absolutePath.shellQuoted()}")
-            appendLine("SHIM_BIND=${commandShimDirectory.absolutePath.shellQuoted()}")
-            appendLine("TMPDIR_PATH=${runtime.tempDirectory.absolutePath.shellQuoted()}")
-            appendLine("mkdir -p \"${'$'}TMPDIR_PATH\" \"${'$'}HOME_BIND\" \"${'$'}WORKSPACE_BIND\" \"${'$'}SHIM_BIND\"")
-            appendLine("export PROOT_TMPDIR=\"${'$'}TMPDIR_PATH\"")
-            appendLine("export PROOT_LOADER=\"${'$'}PROOT_LOADER_PATH\"")
-            appendLine("export HOME=/root")
-            appendLine("export TERM=\"${'$'}{TERM:-xterm-256color}\"")
-            appendLine("ARGS=\"--kill-on-exit -0 -r ${'$'}ROOTFS -b /dev:/dev -b /proc:/proc -b /sys:/sys -b ${'$'}HOME_BIND:/root -b ${'$'}WORKSPACE_BIND:/workspace -b ${'$'}SHIM_BIND:/phoneserver/bin -w /root\"")
-            appendLine("if [ -d /system ]; then ARGS=\"${'$'}ARGS -b /system:/system\"; fi")
-            appendLine("if [ -d /vendor ]; then ARGS=\"${'$'}ARGS -b /vendor:/vendor\"; fi")
-            appendLine("if [ -d /apex ]; then ARGS=\"${'$'}ARGS -b /apex:/apex\"; fi")
-            appendLine("if [ -d /storage ]; then ARGS=\"${'$'}ARGS -b /storage:/storage\"; fi")
-            appendLine("if [ -e /linkerconfig/ld.config.txt ]; then ARGS=\"${'$'}ARGS -b /linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt\"; fi")
-            appendLine("PROOT_CMD=\"${'$'}HOST_LINKER ${'$'}PROOT_BIN\"")
-            appendLine("if [ \"${'$'}#\" -gt 0 ]; then")
-            appendLine("  exec ${'$'}PROOT_CMD ${'$'}ARGS /usr/bin/env -i HOME=/root TERM=\"${'$'}TERM\" PATH=/phoneserver/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \"${'$'}@\"")
-            appendLine("fi")
-            appendLine("exec ${'$'}PROOT_CMD ${'$'}ARGS /usr/bin/env -i HOME=/root TERM=\"${'$'}TERM\" PATH=/phoneserver/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc")
-        }
-    }
-
-    private fun writeCommandShims() {
-        commandShimDirectory.mkdirs()
-
-        val sudoShim = File(commandShimDirectory, "sudo")
-        sudoShim.writeText(
-                buildString {
-                    appendLine("#!/bin/sh")
-                    appendLine("if [ \"$#\" -eq 0 ]; then")
-                    appendLine("  echo \"Ubuntu userspace already runs as root inside proot. Run the command directly without sudo.\"")
-                    appendLine("  exit 0")
-                    appendLine("fi")
-                    appendLine("exec \"$@\"")
-                }
-        )
-        sudoShim.setExecutable(true, true)
-        sudoShim.setReadable(true, true)
-    }
-
-    private fun ensureUbuntuNetworkConfiguration() {
-        val etcDirectory = File(rootfsDirectory, "etc").apply { mkdirs() }
-        File(etcDirectory, "resolv.conf").writeText(
-                buildString {
-                    appendLine("nameserver 1.1.1.1")
-                    appendLine("nameserver 8.8.8.8")
-                }
-        )
+    private fun rootfsLooksInstalled(): Boolean {
+        return File(layout.rootfsDirectory, "usr").exists() &&
+                File(layout.rootfsDirectory, "etc").exists() &&
+                File(layout.rootfsDirectory, "bin").exists()
     }
 
     private fun resolveBundledRuntime(): BundledProotRuntime? {
-        val prootBinary = File(prootRuntimeDirectory, "bin/proot")
-        val loaderBinary = File(prootRuntimeDirectory, "bin/loader")
-        val loader32Binary = File(prootRuntimeDirectory, "bin/loader32").takeIf { it.exists() }
-        val libraryDirectory = File(prootRuntimeDirectory, "lib")
+        val prootBinary = File(layout.prootRuntimeDirectory, "bin/proot")
+        val loaderBinary = File(layout.prootRuntimeDirectory, "bin/loader")
+        val loader32Binary = File(layout.prootRuntimeDirectory, "bin/loader32").takeIf { it.exists() }
+        val libraryDirectory = File(layout.prootRuntimeDirectory, "lib")
         val tallocLibrary = File(libraryDirectory, "libtalloc.so.2")
-        val tempDirectory = File(prootRuntimeDirectory, "tmp").apply { mkdirs() }
+        val tempDirectory = File(layout.prootRuntimeDirectory, "tmp").apply { mkdirs() }
 
         if (!prootBinary.exists() || !loaderBinary.exists() || !tallocLibrary.exists()) {
             return null
         }
 
-        val metadataFile = File(prootRuntimeDirectory, "metadata.json")
+        val metadataFile = File(layout.prootRuntimeDirectory, "metadata.json")
         val assetAbi = runCatching {
             JSONObject(metadataFile.readText()).optString("androidAbi")
         }.getOrNull().orEmpty()
 
         return BundledProotRuntime(
                 assetAbi = assetAbi,
-                installRoot = prootRuntimeDirectory,
+                installRoot = layout.prootRuntimeDirectory,
                 prootBinary = prootBinary,
                 loaderBinary = loaderBinary,
                 loader32Binary = loader32Binary,
@@ -464,12 +350,6 @@ class UbuntuRuntimeCoordinator(
                 libraryDirectory = libraryDirectory,
                 tempDirectory = tempDirectory
         )
-    }
-
-    private fun rootfsLooksInstalled(): Boolean {
-        return File(rootfsDirectory, "usr").exists() &&
-                File(rootfsDirectory, "etc").exists() &&
-                File(rootfsDirectory, "bin").exists()
     }
 
     private fun resolveRootfsSource(): UbuntuRootfsSource? {
@@ -506,6 +386,4 @@ class UbuntuRuntimeCoordinator(
         }
         return String.format("%.1f %s", value, units[index])
     }
-
-    private fun String.shellQuoted(): String = "'" + replace("'", "'\"'\"'") + "'"
 }

@@ -81,6 +81,9 @@ class UbuntuRootfsInstaller(
             }
         }
 
+        val verifying = coordinator.markVerifyingBoot(source, archiveFile.length())
+        onSnapshotChanged(verifying)
+
         val ready = coordinator.markReady(source)
         onSnapshotChanged(ready)
         ready

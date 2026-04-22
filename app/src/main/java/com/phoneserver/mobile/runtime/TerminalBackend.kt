@@ -63,5 +63,9 @@ interface TerminalBackend {
             timeoutSeconds: Int = 10
     ): TerminalCommandResult
 
+    suspend fun resize(columns: Int, rows: Int) {}
+
+    suspend fun interrupt(): Boolean = false
+
     suspend fun close()
 }
