@@ -17,6 +17,7 @@ class UbuntuRuntimeCoordinator(
     private val cacheDirectory = File(runtimeRoot, "cache")
     private val workspaceMountDirectory = File(appContext.filesDir, "workspaces").apply { mkdirs() }
     private val prootRuntimeDirectory = File(runtimeRoot, "proot-runtime")
+    private val commandShimDirectory = File(runtimeRoot, "command-shims")
     private val launcherScript = File(runtimeRoot, "start-ubuntu.sh")
     private val runtimeNote = File(runtimeRoot, "ubuntu-runtime.txt")
     private val store = UbuntuRuntimeStore(appContext)
@@ -314,6 +315,7 @@ class UbuntuRuntimeCoordinator(
         cacheDirectory.mkdirs()
         workspaceMountDirectory.mkdirs()
         prootRuntimeDirectory.mkdirs()
+        commandShimDirectory.mkdirs()
     }
 
     private fun writePreparationFiles(source: UbuntuRootfsSource) {
@@ -336,6 +338,8 @@ class UbuntuRuntimeCoordinator(
                     }
                 }
         )
+
+        writeCommandShims()
 
         val launcherContents = if (bundledRuntime != null && rootfsLooksInstalled()) {
             buildLauncherScript(bundledRuntime)
@@ -376,27 +380,48 @@ class UbuntuRuntimeCoordinator(
             appendLine("#!/system/bin/sh")
             appendLine("set -eu")
             appendLine("PROOT_BIN=${runtime.prootBinary.absolutePath.shellQuoted()}")
+            appendLine("HOST_LINKER=${runtime.hostLinkerPath.shellQuoted()}")
             appendLine("PROOT_LOADER_PATH=${runtime.loaderBinary.absolutePath.shellQuoted()}")
             appendLine("ROOTFS=${rootfsDirectory.absolutePath.shellQuoted()}")
             appendLine("HOME_BIND=${homeDirectory.absolutePath.shellQuoted()}")
             appendLine("WORKSPACE_BIND=${workspaceMountDirectory.absolutePath.shellQuoted()}")
+            appendLine("SHIM_BIND=${commandShimDirectory.absolutePath.shellQuoted()}")
             appendLine("TMPDIR_PATH=${runtime.tempDirectory.absolutePath.shellQuoted()}")
-            appendLine("mkdir -p \"${'$'}TMPDIR_PATH\" \"${'$'}HOME_BIND\" \"${'$'}WORKSPACE_BIND\"")
+            appendLine("mkdir -p \"${'$'}TMPDIR_PATH\" \"${'$'}HOME_BIND\" \"${'$'}WORKSPACE_BIND\" \"${'$'}SHIM_BIND\"")
             appendLine("export PROOT_TMPDIR=\"${'$'}TMPDIR_PATH\"")
             appendLine("export PROOT_LOADER=\"${'$'}PROOT_LOADER_PATH\"")
             appendLine("export HOME=/root")
             appendLine("export TERM=\"${'$'}{TERM:-xterm-256color}\"")
-            appendLine("ARGS=\"--kill-on-exit -0 -r ${'$'}ROOTFS -b /dev:/dev -b /proc:/proc -b /sys:/sys -b ${'$'}HOME_BIND:/root -b ${'$'}WORKSPACE_BIND:/workspace -w /root\"")
+            appendLine("ARGS=\"--kill-on-exit -0 -r ${'$'}ROOTFS -b /dev:/dev -b /proc:/proc -b /sys:/sys -b ${'$'}HOME_BIND:/root -b ${'$'}WORKSPACE_BIND:/workspace -b ${'$'}SHIM_BIND:/phoneserver/bin -w /root\"")
             appendLine("if [ -d /system ]; then ARGS=\"${'$'}ARGS -b /system:/system\"; fi")
             appendLine("if [ -d /vendor ]; then ARGS=\"${'$'}ARGS -b /vendor:/vendor\"; fi")
             appendLine("if [ -d /apex ]; then ARGS=\"${'$'}ARGS -b /apex:/apex\"; fi")
             appendLine("if [ -d /storage ]; then ARGS=\"${'$'}ARGS -b /storage:/storage\"; fi")
             appendLine("if [ -e /linkerconfig/ld.config.txt ]; then ARGS=\"${'$'}ARGS -b /linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt\"; fi")
+            appendLine("PROOT_CMD=\"${'$'}HOST_LINKER ${'$'}PROOT_BIN\"")
             appendLine("if [ \"${'$'}#\" -gt 0 ]; then")
-            appendLine("  exec \"${'$'}PROOT_BIN\" ${'$'}ARGS /usr/bin/env -i HOME=/root TERM=\"${'$'}TERM\" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \"${'$'}@\"")
+            appendLine("  exec ${'$'}PROOT_CMD ${'$'}ARGS /usr/bin/env -i HOME=/root TERM=\"${'$'}TERM\" PATH=/phoneserver/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \"${'$'}@\"")
             appendLine("fi")
-            appendLine("exec \"${'$'}PROOT_BIN\" ${'$'}ARGS /usr/bin/env -i HOME=/root TERM=\"${'$'}TERM\" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc")
+            appendLine("exec ${'$'}PROOT_CMD ${'$'}ARGS /usr/bin/env -i HOME=/root TERM=\"${'$'}TERM\" PATH=/phoneserver/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc")
         }
+    }
+
+    private fun writeCommandShims() {
+        commandShimDirectory.mkdirs()
+
+        val sudoShim = File(commandShimDirectory, "sudo")
+        sudoShim.writeText(
+                buildString {
+                    appendLine("#!/bin/sh")
+                    appendLine("if [ \"$#\" -eq 0 ]; then")
+                    appendLine("  echo \"Ubuntu userspace already runs as root inside proot. Run the command directly without sudo.\"")
+                    appendLine("  exit 0")
+                    appendLine("fi")
+                    appendLine("exec \"$@\"")
+                }
+        )
+        sudoShim.setExecutable(true, true)
+        sudoShim.setReadable(true, true)
     }
 
     private fun ensureUbuntuNetworkConfiguration() {
@@ -432,6 +457,10 @@ class UbuntuRuntimeCoordinator(
                 prootBinary = prootBinary,
                 loaderBinary = loaderBinary,
                 loader32Binary = loader32Binary,
+                hostLinkerPath = when (assetAbi) {
+                    "arm64-v8a", "x86_64" -> "/system/bin/linker64"
+                    else -> "/system/bin/linker"
+                },
                 libraryDirectory = libraryDirectory,
                 tempDirectory = tempDirectory
         )

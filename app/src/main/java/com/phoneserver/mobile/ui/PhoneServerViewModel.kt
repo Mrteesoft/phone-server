@@ -94,12 +94,21 @@ data class PhoneServerUiState(
         val ubuntuRuntime: UbuntuRuntimeSummary
 )
 
+private data class UbuntuRuntimeTerminalEvent(
+        val key: String,
+        val kind: TerminalLineKind,
+        val message: String
+)
+
 class PhoneServerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val workspaceManager = WorkspaceManager(application)
     private val terminalHistoryStore = TerminalHistoryStore(application)
     private val nextLineId = AtomicLong(0L)
     private val initialWorkspaces = workspaceManager.listWorkspaces()
+    private var pendingUbuntuAutoSwitch = false
+    private var hasObservedUbuntuRuntime = false
+    private var lastUbuntuRuntimeEventKey: String? = null
 
     private val _uiState = MutableStateFlow(
             PhoneServerUiState(
@@ -195,6 +204,8 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                             ubuntuRuntime = mapUbuntuRuntime(snapshot)
                     )
                 }
+                appendUbuntuRuntimeEventIfNeeded(snapshot)
+                maybeAutoSwitchToUbuntu(snapshot)
             }
         }
     }
@@ -366,13 +377,15 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             val snapshot = PhoneServerRuntimeManager.prepareUbuntuRuntime()
             appendLine(TerminalLineKind.STATUS, "Ubuntu scaffold prepared at ${snapshot.runtimeRootPath}")
-            appendLine(TerminalLineKind.STATUS, snapshot.detail)
         }
     }
 
     fun installUbuntuRuntime() {
         viewModelScope.launch {
             val result = PhoneServerRuntimeManager.installUbuntuRuntime()
+            if (result.success) {
+                pendingUbuntuAutoSwitch = true
+            }
             appendLine(
                     kind = if (result.success) TerminalLineKind.STATUS else TerminalLineKind.ERROR,
                     text = result.message
@@ -420,6 +433,17 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                     terminalLines = current.terminalLines + TerminalLine(nextLineId.getAndIncrement(), kind, text)
             )
         }
+    }
+
+    private fun appendUbuntuRuntimeEventIfNeeded(snapshot: UbuntuRuntimeSnapshot) {
+        val event = buildUbuntuRuntimeTerminalEvent(snapshot)
+        hasObservedUbuntuRuntime = true
+        if (event == null || event.key == lastUbuntuRuntimeEventKey) {
+            return
+        }
+
+        lastUbuntuRuntimeEventKey = event.key
+        appendLine(event.kind, event.message)
     }
 
     private fun applyCommandResult(
@@ -500,6 +524,41 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    private suspend fun maybeAutoSwitchToUbuntu(snapshot: UbuntuRuntimeSnapshot) {
+        if (snapshot.phase == UbuntuInstallPhase.FAILED) {
+            pendingUbuntuAutoSwitch = false
+            return
+        }
+
+        if (!pendingUbuntuAutoSwitch ||
+                snapshot.phase != UbuntuInstallPhase.READY ||
+                !snapshot.backendReady) {
+            return
+        }
+
+        pendingUbuntuAutoSwitch = false
+        val sourceKind = _uiState.value.terminalRuntime.kind
+        if (sourceKind == TerminalBackendKind.UBUNTU_2204) {
+            return
+        }
+
+        val result = PhoneServerRuntimeManager.switchTerminalRuntime(TerminalBackendKind.UBUNTU_2204)
+        if (result.success) {
+            updateDirectoryForRuntimeSwitch(
+                    sourceKind = sourceKind,
+                    targetKind = TerminalBackendKind.UBUNTU_2204
+            )
+        }
+        appendLine(
+                kind = if (result.success) TerminalLineKind.STATUS else TerminalLineKind.ERROR,
+                text = if (result.success) {
+                    "Ubuntu install complete. ${result.message}"
+                } else {
+                    result.message
+                }
+        )
+    }
+
     private fun isRootOnlyCommand(command: String): Boolean {
         val firstToken = command.substringBefore(' ').lowercase()
         return firstToken == "sudo" || firstToken == "su"
@@ -547,7 +606,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                 }
 
             UbuntuInstallPhase.FAILED.name ->
-                "$prefix Ubuntu setup failed. Open Services, check the runtime state, and retry the Ubuntu install."
+                "$prefix Ubuntu setup failed: ${ubuntuRuntime.detail}. Open Services, check the runtime state, and repair the Ubuntu install."
 
             else ->
                 "$prefix This terminal is still the Android app sandbox, not a real Ubuntu shell."
@@ -688,7 +747,7 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
                 canInstall = canInstall,
                 canUse = snapshot.backendReady,
                 installButtonLabel = when (snapshot.phase) {
-                    UbuntuInstallPhase.FAILED -> "Retry Install"
+                    UbuntuInstallPhase.FAILED -> "Repair Ubuntu"
                     UbuntuInstallPhase.READY -> "Installed"
                     UbuntuInstallPhase.DOWNLOADING_ROOTFS,
                     UbuntuInstallPhase.EXTRACTING_ROOTFS -> "Installing..."
@@ -721,6 +780,91 @@ class PhoneServerViewModel(application: Application) : AndroidViewModel(applicat
             }
 
             else -> ""
+        }
+    }
+
+    private fun buildUbuntuRuntimeTerminalEvent(
+            snapshot: UbuntuRuntimeSnapshot
+    ): UbuntuRuntimeTerminalEvent? {
+        if (!hasObservedUbuntuRuntime && snapshot.phase == UbuntuInstallPhase.NOT_INSTALLED) {
+            return null
+        }
+
+        return when (snapshot.phase) {
+            UbuntuInstallPhase.NOT_INSTALLED -> null
+
+            UbuntuInstallPhase.SCAFFOLD_READY ->
+                UbuntuRuntimeTerminalEvent(
+                        key = "ubuntu-scaffold:${snapshot.detail}",
+                        kind = TerminalLineKind.STATUS,
+                        message = snapshot.detail
+                )
+
+            UbuntuInstallPhase.DOWNLOADING_ROOTFS -> buildUbuntuDownloadEvent(snapshot)
+
+            UbuntuInstallPhase.EXTRACTING_ROOTFS -> buildUbuntuExtractionEvent(snapshot)
+
+            UbuntuInstallPhase.READY ->
+                UbuntuRuntimeTerminalEvent(
+                        key = "ubuntu-ready:${snapshot.detail}:${snapshot.backendReady}",
+                        kind = TerminalLineKind.STATUS,
+                        message = snapshot.detail
+                )
+
+            UbuntuInstallPhase.FAILED ->
+                UbuntuRuntimeTerminalEvent(
+                        key = "ubuntu-failed:${snapshot.errorMessage ?: snapshot.detail}",
+                        kind = TerminalLineKind.ERROR,
+                        message = "Ubuntu install failed: ${snapshot.errorMessage ?: snapshot.detail}"
+                )
+        }
+    }
+
+    private fun buildUbuntuDownloadEvent(
+            snapshot: UbuntuRuntimeSnapshot
+    ): UbuntuRuntimeTerminalEvent {
+        val bucket = if (snapshot.totalBytes > 0L) {
+            ((snapshot.downloadedBytes * 10) / snapshot.totalBytes).toInt()
+        } else {
+            (snapshot.downloadedBytes / (8L * 1024L * 1024L)).toInt()
+        }
+
+        val message = if (bucket <= 0) {
+            snapshot.detail
+        } else if (snapshot.totalBytes > 0L) {
+            "Ubuntu download progress: ${formatBytes(snapshot.downloadedBytes)} / ${formatBytes(snapshot.totalBytes)}"
+        } else {
+            "Ubuntu download progress: ${formatBytes(snapshot.downloadedBytes)} downloaded"
+        }
+
+        return UbuntuRuntimeTerminalEvent(
+                key = "ubuntu-download:${bucket}:${snapshot.totalBytes}",
+                kind = TerminalLineKind.STATUS,
+                message = message
+        )
+    }
+
+    private fun buildUbuntuExtractionEvent(
+            snapshot: UbuntuRuntimeSnapshot
+    ): UbuntuRuntimeTerminalEvent {
+        val extractedEntries = Regex("(\\d+)").find(snapshot.detail)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+
+        return if (extractedEntries == null) {
+            UbuntuRuntimeTerminalEvent(
+                    key = "ubuntu-extract:${snapshot.detail}",
+                    kind = TerminalLineKind.STATUS,
+                    message = snapshot.detail
+            )
+        } else {
+            val bucket = extractedEntries / 400
+            UbuntuRuntimeTerminalEvent(
+                    key = "ubuntu-extract:${bucket}",
+                    kind = TerminalLineKind.STATUS,
+                    message = "Ubuntu extraction progress: $extractedEntries archive entries unpacked."
+            )
         }
     }
 

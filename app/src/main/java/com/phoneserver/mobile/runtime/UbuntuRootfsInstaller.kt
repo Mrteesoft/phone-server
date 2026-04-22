@@ -7,6 +7,13 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.nio.file.FileVisitResult
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.net.URL
 import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +25,12 @@ import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 class UbuntuRootfsInstaller(
         private val coordinator: UbuntuRuntimeCoordinator
 ) {
+
+    private data class PendingHardLink(
+            val target: File,
+            val source: File,
+            val mode: Int
+    )
 
     suspend fun install(
             onSnapshotChanged: suspend (UbuntuRuntimeSnapshot) -> Unit
@@ -173,6 +186,7 @@ class UbuntuRootfsInstaller(
             onEntryExtracted: suspend (Int) -> Unit
     ) = withContext(Dispatchers.IO) {
         var extractedEntries = 0
+        val pendingHardLinks = mutableListOf<PendingHardLink>()
 
         FileInputStream(archiveFile).use { fileInputStream: FileInputStream ->
             BufferedInputStream(fileInputStream).use { bufferedInputStream: BufferedInputStream ->
@@ -183,17 +197,21 @@ class UbuntuRootfsInstaller(
                             val target = safeResolve(rootfsDirectory, entry.name)
                             when {
                                 entry.isDirectory -> {
-                                    if (!target.exists()) {
-                                        target.mkdirs()
-                                    }
+                                    ensureDirectoryTarget(target)
                                 }
 
                                 entry.isSymbolicLink -> createSymbolicLink(target, entry.linkName)
-                                entry.isLink -> createHardLink(rootfsDirectory, target, entry.linkName)
+                                entry.isLink -> pendingHardLinks += PendingHardLink(
+                                        target = target,
+                                        source = safeResolve(rootfsDirectory, entry.linkName),
+                                        mode = entry.mode
+                                )
                                 else -> writeRegularFile(tarInputStream, target)
                             }
 
-                            applyPermissions(target, entry.mode, entry.isDirectory)
+                            if (!entry.isLink) {
+                                applyPermissions(target, entry.mode, entry.isDirectory)
+                            }
                             extractedEntries += 1
                             onEntryExtracted(extractedEntries)
                             entry = tarInputStream.nextEntry
@@ -202,13 +220,15 @@ class UbuntuRootfsInstaller(
                 }
             }
         }
+
+        resolvePendingHardLinks(pendingHardLinks)
     }
 
     private fun writeRegularFile(
             tarInputStream: TarArchiveInputStream,
             target: File
     ) {
-        target.parentFile?.mkdirs()
+        prepareNonDirectoryTarget(target)
         FileOutputStream(target).use { output ->
             val buffer = ByteArray(EXTRACTION_BUFFER_SIZE)
             while (true) {
@@ -226,33 +246,64 @@ class UbuntuRootfsInstaller(
             target: File,
             linkName: String
     ) {
-        target.parentFile?.mkdirs()
-        if (target.exists() || target.isDirectory || target.isFile) {
-            target.delete()
-        }
+        prepareNonDirectoryTarget(target)
         runCatching { Os.symlink(linkName, target.absolutePath) }
                 .getOrElse { error ->
-                    throw IOException("Failed to create symbolic link ${target.absolutePath}.", error)
+                    throw IOException(
+                            "Failed to create symbolic link ${target.absolutePath} -> $linkName.",
+                            error
+                    )
                 }
     }
 
     private fun createHardLink(
-            rootfsDirectory: File,
             target: File,
-            linkName: String
+            source: File
     ) {
-        val source = safeResolve(rootfsDirectory, linkName)
-        target.parentFile?.mkdirs()
-        if (target.exists() || target.isDirectory || target.isFile) {
-            target.delete()
+        prepareNonDirectoryTarget(target)
+        val sourcePath = source.toPath()
+        if (!Files.exists(sourcePath, LinkOption.NOFOLLOW_LINKS)) {
+            throw IOException("Hard link source does not exist: ${source.absolutePath}.")
         }
+
         runCatching { Os.link(source.absolutePath, target.absolutePath) }
+                .recoverCatching {
+                    Files.copy(sourcePath, target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                }
                 .getOrElse { error ->
                     throw IOException(
                             "Failed to create hard link ${target.absolutePath} -> ${source.absolutePath}.",
                             error
                     )
                 }
+    }
+
+    private fun resolvePendingHardLinks(
+            pendingHardLinks: List<PendingHardLink>
+    ) {
+        val remaining = pendingHardLinks.toMutableList()
+        while (remaining.isNotEmpty()) {
+            var resolvedInPass = false
+            val iterator = remaining.iterator()
+            while (iterator.hasNext()) {
+                val pending = iterator.next()
+                if (!Files.exists(pending.source.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                    continue
+                }
+
+                createHardLink(target = pending.target, source = pending.source)
+                applyPermissions(pending.target, pending.mode, false)
+                iterator.remove()
+                resolvedInPass = true
+            }
+
+            if (!resolvedInPass) {
+                val unresolved = remaining.first()
+                throw IOException(
+                        "Hard link source was not extracted: ${unresolved.source.absolutePath}."
+                )
+            }
+        }
     }
 
     private fun safeResolve(
@@ -267,12 +318,73 @@ class UbuntuRootfsInstaller(
         return resolvedPath.toFile()
     }
 
+    private fun ensureDirectoryTarget(target: File) {
+        val path = target.toPath()
+        if (Files.exists(path, LinkOption.NOFOLLOW_LINKS) &&
+                !Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+            deleteRecursively(path)
+        }
+        Files.createDirectories(path)
+    }
+
+    private fun prepareNonDirectoryTarget(target: File) {
+        target.parentFile?.toPath()?.let { Files.createDirectories(it) }
+        val targetPath = target.toPath()
+        if (Files.exists(targetPath, LinkOption.NOFOLLOW_LINKS)) {
+            deleteRecursively(targetPath)
+        }
+    }
+
+    private fun deleteRecursively(path: Path) {
+        runCatching {
+            if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+                return
+            }
+
+            if (Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS) &&
+                    !Files.isSymbolicLink(path)) {
+                Files.walkFileTree(
+                        path,
+                        object : SimpleFileVisitor<Path>() {
+                            override fun visitFile(
+                                    file: Path,
+                                    attrs: BasicFileAttributes
+                            ): FileVisitResult {
+                                Files.delete(file)
+                                return FileVisitResult.CONTINUE
+                            }
+
+                            override fun postVisitDirectory(
+                                    dir: Path,
+                                    exc: IOException?
+                            ): FileVisitResult {
+                                if (exc != null) {
+                                    throw exc
+                                }
+                                Files.delete(dir)
+                                return FileVisitResult.CONTINUE
+                            }
+                        }
+                )
+            } else {
+                Files.delete(path)
+            }
+        }.getOrElse { error ->
+            throw IOException(
+                    "Failed to remove existing path before extracting Ubuntu rootfs: $path",
+                    error
+            )
+        }
+    }
+
     private fun applyPermissions(
             target: File,
             mode: Int,
             isDirectory: Boolean
     ) {
-        if (!target.exists()) {
+        val targetPath = target.toPath()
+        if (!Files.exists(targetPath, LinkOption.NOFOLLOW_LINKS) ||
+                Files.isSymbolicLink(targetPath)) {
             return
         }
 

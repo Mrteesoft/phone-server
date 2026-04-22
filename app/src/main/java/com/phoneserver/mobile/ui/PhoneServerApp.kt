@@ -2,6 +2,7 @@ package com.phoneserver.mobile.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -59,11 +60,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import com.phoneserver.mobile.runtime.TerminalBackendKind
+import com.phoneserver.mobile.runtime.UbuntuInstallPhase
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -288,6 +291,38 @@ private fun TerminalScreen(
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
     val terminalInteractionSource = remember { MutableInteractionSource() }
+    val terminalTapModifier = Modifier.pointerInput(Unit) {
+        detectTapGestures(
+                onTap = {
+                    focusRequester.requestFocus()
+                    keyboardController?.show()
+                }
+        )
+    }
+    val statusIndicatorColor = when {
+        runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                ubuntuRuntime.phase == UbuntuInstallPhase.FAILED.name -> Color(0xFFFF8B7C)
+
+        runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                (ubuntuRuntime.phase == UbuntuInstallPhase.DOWNLOADING_ROOTFS.name ||
+                        ubuntuRuntime.phase == UbuntuInstallPhase.EXTRACTING_ROOTFS.name) -> Color(0xFFF59E0B)
+
+        uiState.runningCommand -> Color(0xFFF59E0B)
+        else -> Color(0xFF10B981)
+    }
+    val statusLabel = when {
+        runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                ubuntuRuntime.phase == UbuntuInstallPhase.DOWNLOADING_ROOTFS.name -> "installing"
+
+        runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                ubuntuRuntime.phase == UbuntuInstallPhase.EXTRACTING_ROOTFS.name -> "extracting"
+
+        runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                ubuntuRuntime.phase == UbuntuInstallPhase.FAILED.name -> "failed"
+
+        uiState.runningCommand -> "busy"
+        else -> "ready"
+    }
 
     fun submitCommand() {
         val trimmed = command.trim()
@@ -356,12 +391,12 @@ private fun TerminalScreen(
                         modifier = Modifier
                                 .size(8.dp)
                                 .background(
-                                        color = if (uiState.runningCommand) Color(0xFFF59E0B) else Color(0xFF10B981),
+                                        color = statusIndicatorColor,
                                         shape = CircleShape
                                 )
                 )
                 Text(
-                        text = if (uiState.runningCommand) "busy" else "ready",
+                        text = statusLabel,
                         color = Color(0xFF9CA3AF),
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.bodySmall
@@ -389,6 +424,32 @@ private fun TerminalScreen(
                                 color = Color(0xFFA7F3D0),
                                 fontFamily = FontFamily.Monospace
                         )
+                    }
+                }
+            }
+
+            runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                    ubuntuRuntime.phase == UbuntuInstallPhase.FAILED.name -> {
+                Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                            text = ubuntuRuntime.detail,
+                            color = Color(0xFFFF8B7C),
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f)
+                    )
+                    if (ubuntuRuntime.canInstall) {
+                        TextButton(onClick = onInstallUbuntuRuntime) {
+                            Text(
+                                    text = ubuntuRuntime.installButtonLabel.lowercase(),
+                                    color = Color(0xFFA7F3D0),
+                                    fontFamily = FontFamily.Monospace
+                            )
+                        }
                     }
                 }
             }
@@ -439,6 +500,30 @@ private fun TerminalScreen(
                 }
             }
 
+            runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                    ubuntuRuntime.phase == UbuntuInstallPhase.DOWNLOADING_ROOTFS.name -> {
+                Text(
+                        text = if (ubuntuRuntime.progressLabel.isNotBlank()) {
+                            "Ubuntu download in progress: ${ubuntuRuntime.progressLabel}"
+                        } else {
+                            ubuntuRuntime.detail
+                        },
+                        color = Color(0xFF9CA3AF),
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            runtime.kind == TerminalBackendKind.ANDROID_LOCAL &&
+                    ubuntuRuntime.phase == UbuntuInstallPhase.EXTRACTING_ROOTFS.name -> {
+                Text(
+                        text = ubuntuRuntime.detail,
+                        color = Color(0xFF9CA3AF),
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall
+                )
+            }
+
             runtime.kind == TerminalBackendKind.UBUNTU_2204 -> {
                 Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -471,7 +556,8 @@ private fun TerminalScreen(
             LazyColumn(
                     modifier = Modifier
                             .fillMaxSize()
-                            .padding(top = 6.dp, bottom = 72.dp),
+                            .padding(top = 6.dp, bottom = 72.dp)
+                            .then(terminalTapModifier),
                     state = listState,
                     verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {

@@ -30,9 +30,15 @@ class UbuntuProotBackend(
             timeoutSeconds: Int,
             onOutputLine: (String) -> Unit
     ): TerminalCommandResult {
+        val normalizedCommand = normalizeCommand(command)
+                ?: return TerminalCommandResult(
+                        output = "Ubuntu userspace already runs as root inside proot. Run the command directly without sudo.",
+                        currentDirectory = homeDirectory,
+                        exitCode = 0
+                )
         val snapshot = runtimeSnapshotProvider()
         if (!snapshot.backendReady || snapshot.runtimeLauncherPath.isBlank()) {
-            return unavailableResult(snapshot, command)
+            return unavailableResult(snapshot, normalizedCommand)
         }
 
         val launcher = File(snapshot.runtimeLauncherPath)
@@ -51,7 +57,7 @@ class UbuntuProotBackend(
                         exitCode = 127
                 )
 
-        return terminalSession.execute(command, timeoutSeconds, onOutputLine)
+        return terminalSession.execute(normalizedCommand, timeoutSeconds, onOutputLine)
     }
 
     override suspend fun changeDirectory(
@@ -102,6 +108,7 @@ class UbuntuProotBackend(
                 ?: launcher.parentFile
 
         val process = ProcessBuilder(
+                resolveHostShellPath(),
                 launcher.absolutePath,
                 "/bin/bash",
                 "--noprofile",
@@ -144,7 +151,7 @@ class UbuntuProotBackend(
                 homeDirectory = homeDirectory
         ) {
             PtyLaunchConfiguration(
-                    argv = listOf(launcher.absolutePath),
+                    argv = listOf(resolveHostShellPath(), launcher.absolutePath),
                     environment = mapOf("TERM" to "xterm-256color"),
                     workingDirectory = homeDirectory
             )
@@ -187,6 +194,25 @@ class UbuntuProotBackend(
             UbuntuInstallPhase.FAILED ->
                 snapshot.errorMessage ?: "Ubuntu runtime setup failed."
         }
+    }
+
+    private fun normalizeCommand(command: String): String? {
+        val trimmed = command.trim()
+        if (trimmed == "sudo") {
+            return null
+        }
+
+        return if (trimmed.startsWith("sudo ")) {
+            trimmed.removePrefix("sudo ").trimStart()
+        } else {
+            trimmed
+        }
+    }
+
+    private fun resolveHostShellPath(): String {
+        val candidates = listOf("/system/bin/sh", "/system/xbin/sh", "sh")
+        return candidates.firstOrNull { candidate -> candidate == "sh" || File(candidate).exists() }
+                ?: "sh"
     }
 
     private fun String.shellQuoted(): String = "'" + replace("'", "'\"'\"'") + "'"

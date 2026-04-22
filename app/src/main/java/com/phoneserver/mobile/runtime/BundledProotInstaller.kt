@@ -10,6 +10,7 @@ internal data class BundledProotRuntime(
         val prootBinary: File,
         val loaderBinary: File,
         val loader32Binary: File?,
+        val hostLinkerPath: String,
         val libraryDirectory: File,
         val tempDirectory: File
 )
@@ -62,6 +63,7 @@ internal class BundledProotInstaller(
                 prootBinary = prootBinary,
                 loaderBinary = loaderBinary,
                 loader32Binary = loader32Binary,
+                hostLinkerPath = resolveHostLinkerPath(assetAbi),
                 libraryDirectory = libDirectory,
                 tempDirectory = tmpDirectory
         )
@@ -152,5 +154,12 @@ internal class BundledProotInstaller(
     private fun resolveAssetAbi(): String? {
         val supported = setOf("arm64-v8a", "armeabi-v7a", "x86_64")
         return Build.SUPPORTED_ABIS.firstOrNull { it in supported }
+    }
+
+    private fun resolveHostLinkerPath(assetAbi: String): String {
+        return when (assetAbi) {
+            "arm64-v8a", "x86_64" -> "/system/bin/linker64"
+            else -> "/system/bin/linker"
+        }
     }
 }
